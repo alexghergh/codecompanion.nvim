@@ -1531,6 +1531,22 @@ function Chat:done(output, reasoning, tools, meta, opts)
 
   if opts.status == "stopped" then
     self:_complete_orphaned_tool_calls()
+
+    -- When cancelled before any LLM output, header_line still points two
+    -- lines past EOF where submit() advanced it anticipating the LLM header,
+    -- and ready_for_input() only recomputes it when the last role flipped;
+    -- every later parse then misses the user's draft and the next submit
+    -- sends a blank message. Stateful agents have already committed the
+    -- submitted message by the time the cancel lands (claude-agent-acp
+    -- persists it to the session record even for turns cancelled before
+    -- output), so re-sending it would duplicate it agent-side. Mirror Claude
+    -- Code's cancel behavior: keep the message, mark it sent, and write the
+    -- LLM header so ready_for_input() opens a fresh user section below.
+    if self._last_role == config.constants.USER_ROLE then
+      self:label_sent_items()
+      self._last_role = config.constants.LLM_ROLE
+      self:add_buf_message({ role = config.constants.LLM_ROLE })
+    end
   end
 
   -- Commonly, a status may not be set if the message exceeds a token limit
