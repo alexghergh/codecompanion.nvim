@@ -205,6 +205,19 @@ function M.select_model(chat)
         display = model
       end
 
+      -- Distinct models can share a display name (e.g. ACP agents resolving
+      -- several advertised ids onto the same underlying model); append the
+      -- wire id when the display doesn't already carry it
+      if
+        type(model) == "table"
+        and model_id
+        and display
+        and display ~= model_id
+        and not display:find(model_id, 1, true)
+      then
+        display = string.format("%s (%s)", display, model_id)
+      end
+
       -- Mark the current model
       if model_id == current_id then
         return "* " .. display
