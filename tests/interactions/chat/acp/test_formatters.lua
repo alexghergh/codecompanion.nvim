@@ -250,4 +250,17 @@ T["ACP Formatters"]["nil tool_call is normalised to 'Other: Invalid tool call'"]
   h.eq("Other: Invalid tool call", child.lua_get("formatters.tool_message(nil, { opts = {} })"))
 end
 
+T["ACP Formatters"]["error_lines - streamed command output"] = function()
+  h.eq(
+    { "command failed", "details" },
+    child.lua_get([[
+      formatters.error_lines({
+        status = "failed",
+        rawOutput = { exit_code = 1 },
+        streamed_output = "command failed\ndetails\n",
+      })
+    ]])
+  )
+end
+
 return T
