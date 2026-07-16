@@ -185,7 +185,10 @@ function Builder:add_message(data, opts)
       }
     end
 
-    self.state.block_type = block
+    -- Anchored inserts are not part of the streamed append flow
+    if not opts.insert_at then
+      self.state.block_type = block
+    end
   end
 
   if vim.tbl_isempty(lines) then

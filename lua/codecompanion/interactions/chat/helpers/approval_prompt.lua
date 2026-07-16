@@ -1,3 +1,4 @@
+local Icons = require("codecompanion.interactions.chat.ui.icons")
 local config = require("codecompanion.config")
 local labels = require("codecompanion.interactions.chat.tools.labels")
 local log = require("codecompanion.utils.log")
@@ -6,6 +7,8 @@ local ui_utils = require("codecompanion.utils.ui")
 local utils = require("codecompanion.utils")
 
 local fmt = string.format
+
+local ANCHOR_NS = vim.api.nvim_create_namespace("CodeCompanion-approval_anchor")
 
 local M = {}
 
@@ -58,7 +61,24 @@ function M.request(chat, opts)
   utils.fire("ToolApprovalRequested", { bufnr = bufnr, name = opts.name })
 
   local content = build_message(opts)
-  chat:add_buf_message({ role = config.constants.LLM_ROLE, content = content })
+  local prompt_end = chat:add_buf_message({ role = config.constants.LLM_ROLE, content = content })
+
+  -- Anchor the eventual feedback to the prompt block: the agent keeps
+  -- streaming (e.g. tool labels of already-approved calls) while the user
+  -- decides, so writing the feedback at the buffer end can land it below
+  -- unrelated content. The anchor must sit on the last non-blank prompt line
+  -- (the choice list): the builder trims trailing blank runs before streamed
+  -- writes and merges chunk text into the tail line, so an anchor on a
+  -- trailing blank gets deleted or acquires streamed content
+  local anchor_id
+  if prompt_end then
+    local row = prompt_end - 1
+    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, prompt_end, false)
+    while row > 0 and (lines[row + 1] == nil or lines[row + 1] == "") do
+      row = row - 1
+    end
+    anchor_id = vim.api.nvim_buf_set_extmark(bufnr, ANCHOR_NS, row, 0, { right_gravity = false })
+  end
 
   if config.interactions.chat.tools.opts.notify_on_approval and not ui_utils.buf_is_active(bufnr) then
     utils.notify("Tool approval required")
@@ -80,10 +100,37 @@ function M.request(chat, opts)
     local icons = config.display.chat.icons
     local icon = is_rejection and icons.tool_failure or icons.tool_success
     local status = is_rejection and "failed" or "completed"
-    chat:add_buf_message(
-      { content = fmt("%sYou selected: %s\n\n---\n", icon, choice_label) },
-      { _icon_info = { has_icon = true, status = status } }
-    )
+    local insert_at
+    if anchor_id then
+      local pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, ANCHOR_NS, anchor_id, {})
+      pcall(vim.api.nvim_buf_del_extmark, bufnr, ANCHOR_NS, anchor_id)
+      if pos and pos[1] then
+        insert_at = pos[1] + 1
+      end
+    end
+    if insert_at then
+      -- Whole-line insert directly below the choice list: `nvim_buf_set_text`
+      -- through the builder would splice into the target line and glue the
+      -- "---" onto streamed chunk text, so the feedback goes in via
+      -- `nvim_buf_set_lines`, which never merges. Content that streamed in
+      -- below the prompt stays below the "---", separated by a blank when it
+      -- did not bring its own
+      insert_at = math.min(insert_at, vim.api.nvim_buf_line_count(bufnr))
+      local below = vim.api.nvim_buf_get_lines(bufnr, insert_at, insert_at + 1, false)[1]
+      local feedback = { "", fmt("%sYou selected: %s", icon, choice_label), "", "---" }
+      if below ~= nil and below ~= "" then
+        table.insert(feedback, "")
+      end
+      chat.ui:unlock_buf()
+      vim.api.nvim_buf_set_lines(bufnr, insert_at, insert_at, false, feedback)
+      Icons.apply(bufnr, insert_at + 1, status)
+      chat.ui:lock_buf()
+    else
+      chat:add_buf_message(
+        { content = fmt("%sYou selected: %s\n\n---\n", icon, choice_label) },
+        { _icon_info = { has_icon = true, status = status } }
+      )
+    end
     utils.fire("ToolApprovalFinished", { bufnr = bufnr, choice = choice_label })
   end
 

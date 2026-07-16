@@ -1,3 +1,4 @@
+local Icons = require("codecompanion.interactions.chat.ui.icons")
 local Queue = require("codecompanion.utils.queue")
 
 local async = require("codecompanion.utils.async")
@@ -349,10 +350,21 @@ function ACPHandler:process_tool_call(tool_call)
   -- existing line rather than adding a new one
   local cached = self.ui_state[id]
   if cached then
+    -- The cached line number goes stale when content is inserted above it
+    -- (e.g. approval feedback anchored to its prompt block); the icon extmark
+    -- shifts with the buffer, so resolve the current line from it
+    local line_number = cached.line_number
+    if cached.icon_id then
+      local pos = vim.api.nvim_buf_get_extmark_by_id(self.chat.bufnr, Icons.ns(), cached.icon_id, {})
+      if pos and pos[1] then
+        line_number = pos[1] + 1
+      end
+    end
+
     local call_ok, update_ok, new_icon_id = pcall(
       self.chat.update_buf_line,
       self.chat,
-      cached.line_number,
+      line_number,
       content,
       { status = tool_call.status, icon_id = cached.icon_id, priority = 120, virt_text_pos = "inline" }
     )
