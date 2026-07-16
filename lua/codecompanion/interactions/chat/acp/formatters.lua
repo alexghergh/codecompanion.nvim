@@ -20,7 +20,7 @@
 
 local M = {}
 
-local MAX_TITLE = 60
+local MAX_TITLE = 150
 local MAX_TEXT = 100
 
 ---Normalize a path relative to cwd
@@ -120,6 +120,10 @@ local function parse_title(title)
 
   title = title:gsub("^%s*", "")
 
+  -- Agents put raw multi-line commands in the title (e.g. claude-agent-acp
+  -- sends the full Bash command); collapse to keep the single-line contract
+  title = title:gsub("%s*\n%s*", " ")
+
   local backtick_cmd = title:match("^`([^`]+)`")
   if backtick_cmd then
     return backtick_cmd
@@ -132,8 +136,11 @@ local function parse_title(title)
 
   title = title:gsub("%s*=>.*$", ""):gsub("%s*—.*$", "")
 
+  -- Strip a "ToolName:" prefix from the title; tool names are single words,
+  -- so a prefix containing whitespace is command/prose content that happens
+  -- to hold a colon (e.g. echo "test: done") and must stay intact
   local before_colon = title:match("^%s*([^:]+)%s*:")
-  if before_colon and #before_colon < 40 then
+  if before_colon and #before_colon < 40 and not before_colon:find("%s") then
     local after_colon = title:match("^%s*[^:]+%s*:%s*(.+)")
     if not (after_colon and (after_colon:match("^//") or after_colon:match("^https?://"))) then
       title = before_colon
