@@ -57,6 +57,24 @@ return {
       return false
     end,
 
+    ---Surface the target host for sandbox network permission requests, whose
+    ---bare "SandboxNetworkAccess" title carries no information; every other
+    ---tool call falls through to the default prompt
+    ---@param self CodeCompanion.ACPAdapter
+    ---@param tool_call table
+    ---@return string|nil
+    format_permission_prompt = function(self, tool_call)
+      local raw = tool_call and tool_call.rawInput
+      if type(raw) ~= "table" then
+        return nil
+      end
+      -- sandbox network callback: fires mid-command when a sandboxed command
+      -- attempts an outbound connection to a host outside the allowlist
+      if tool_call.title == "SandboxNetworkAccess" and raw.host then
+        return "Network access: " .. raw.host .. (raw.port and (":" .. raw.port) or "")
+      end
+    end,
+
     ---@param self CodeCompanion.ACPAdapter
     ---@param messages table
     ---@param capabilities table
