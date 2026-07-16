@@ -333,7 +333,7 @@ function Builder:update_line(line_number, content, opts)
     self.chat.ui:lock_buf()
   end
 
-  return true, new_icon_id
+  return ok, new_icon_id
 end
 
 return Builder

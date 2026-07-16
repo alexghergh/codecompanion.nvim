@@ -349,7 +349,7 @@ function ACPHandler:process_tool_call(tool_call)
   -- existing line rather than adding a new one
   local cached = self.ui_state[id]
   if cached then
-    local update_ok, _, new_icon_id = pcall(
+    local call_ok, update_ok, new_icon_id = pcall(
       self.chat.update_buf_line,
       self.chat,
       cached.line_number,
@@ -357,7 +357,7 @@ function ACPHandler:process_tool_call(tool_call)
       { status = tool_call.status, icon_id = cached.icon_id, priority = 120, virt_text_pos = "inline" }
     )
 
-    if update_ok then
+    if call_ok and update_ok then
       if tool_call.status == "completed" then
         self.ui_state[id] = nil
       elseif new_icon_id then
