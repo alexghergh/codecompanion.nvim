@@ -827,6 +827,47 @@ T["ACPHandler"]["Edited Files"]["ignores failed edits and non-edit tool calls"] 
   h.eq(0, result)
 end
 
+T["ACPHandler"]["collects streamed terminal output across updates"] = function()
+  local result = child.lua([[
+    local chat = h.setup_chat_buffer({}, {
+      name = "test_acp",
+      config = {
+        name = "test_acp",
+        type = "acp",
+        handlers = { form_messages = function(a, m) return m end }
+      }
+    })
+
+    local ACPHandler = require("codecompanion.interactions.chat.acp.handler")
+    local handler = ACPHandler.new(chat)
+    chat.add_buf_message = function() end
+
+    handler:process_tool_call({
+      toolCallId = "exec-1",
+      sessionUpdate = "tool_call",
+      status = "in_progress",
+      kind = "read",
+      title = "List files",
+    })
+    handler:process_tool_call({
+      toolCallId = "exec-1",
+      sessionUpdate = "tool_call_update",
+      _meta = { terminal_output_delta = { data = "first\n", terminal_id = "exec-1" } },
+    })
+    handler:process_tool_call({
+      toolCallId = "exec-1",
+      sessionUpdate = "tool_call_update",
+      status = "failed",
+      rawOutput = { exit_code = 2 },
+      _meta = { terminal_output_delta = { data = "second\n", terminal_id = "exec-1" } },
+    })
+
+    return handler.tools["exec-1"].streamed_output
+  ]])
+
+  h.eq("first\nsecond\n", result)
+end
+
 T["ACPHandler"]["Permission Queue"] = new_set()
 
 T["ACPHandler"]["Permission Queue"]["queues concurrent requests and presents one at a time"] = function()

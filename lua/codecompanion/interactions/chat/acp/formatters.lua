@@ -11,6 +11,9 @@
         - Label format: "Kind: <target>" (e.g. "Read: config.json")
         - When `verbose_output` is set on the adapter, completed calls may
           append " — <summary>" or replace the label entirely (edits)
+
+      Failed calls additionally expose `error_lines` so the handler can
+      render the tool's output below the label.
 -------------------------------------------------------------------------------
     Attribution:
       If you use or distribute this code, please credit:
@@ -22,6 +25,7 @@ local M = {}
 
 local MAX_TITLE = 150
 local MAX_TEXT = 100
+local MAX_ERROR_LINES = 10
 
 ---Normalize a path relative to cwd
 ---@param p string
@@ -218,6 +222,73 @@ local function content_summary(tool_call)
   if #parts > 0 then
     return table.concat(parts, "; ")
   end
+end
+
+---Extract a failed tool call's output as display lines, capped at
+---MAX_ERROR_LINES with a "[+N more lines]" marker
+---@param tool_call table
+---@return string[]
+function M.error_lines(tool_call)
+  local parts = {}
+  if type(tool_call.content) == "table" then
+    for _, c in ipairs(tool_call.content) do
+      if c.type == "content" and c.content and c.content.type == "text" and type(c.content.text) == "string" then
+        table.insert(parts, c.content.text)
+      end
+    end
+  end
+
+  -- `rawOutput` has no standard shape; fall back to it only when no displayable
+  -- `content` blocks were sent. claude-agent-acp sends text blocks or a string
+  if #parts == 0 then
+    if type(tool_call.rawOutput) == "table" then
+      for _, c in ipairs(tool_call.rawOutput) do
+        if type(c) == "table" and c.type == "text" and type(c.text) == "string" then
+          table.insert(parts, c.text)
+        end
+      end
+    elseif type(tool_call.rawOutput) == "string" then
+      table.insert(parts, tool_call.rawOutput)
+    end
+  end
+
+  -- codex-acp 2.x sends neither: its output arrives as terminal chunks, which
+  -- the handler collects into `streamed_output`, and `rawOutput` holds only
+  -- the exit code
+  if #parts == 0 and type(tool_call.streamed_output) == "string" then
+    table.insert(parts, tool_call.streamed_output)
+  end
+
+  if #parts == 0 then
+    return {}
+  end
+
+  local text = table.concat(parts, "\n"):gsub("\r\n", "\n"):gsub("%s+$", "")
+  if text == "" then
+    return {}
+  end
+
+  local lines = vim.split(text, "\n", { plain = true })
+
+  -- Agents wrap terminal output in markdown fences (claude-agent-acp fences
+  -- failed Bash output); the highlight carries the visual here, so drop
+  -- wrapper fence lines and the blanks around them
+  while #lines > 0 and (lines[1] == "" or lines[1]:match("^```")) do
+    table.remove(lines, 1)
+  end
+  while #lines > 0 and (lines[#lines] == "" or lines[#lines]:match("^```")) do
+    table.remove(lines, #lines)
+  end
+  if #lines == 0 then
+    return {}
+  end
+
+  if #lines > MAX_ERROR_LINES then
+    local dropped = #lines - MAX_ERROR_LINES
+    lines = vim.list_slice(lines, 1, MAX_ERROR_LINES)
+    table.insert(lines, ("[+%d more lines]"):format(dropped))
+  end
+  return lines
 end
 
 ---Strip backticks and shorten cwd-rooted paths for display in a markdown buffer

@@ -39,6 +39,8 @@ function ACPHandler.new(chat)
   return self --[[@type CodeCompanion.Chat.ACPHandler]]
 end
 
+local ERROR_NS = vim.api.nvim_create_namespace("CodeCompanion-acp_tool_errors")
+
 ---Merge an incoming tool call/update into the cache
 ---@param existing table|nil
 ---@param incoming table|nil
@@ -315,13 +317,49 @@ function ACPHandler:flush_edits(id, tool_call)
   end
 end
 
+---Render a failed tool call's output in red below its label. Written
+---directly to the buffer (not through the builder) so the block stays out
+---of the streamed message flow and its block/type tracking.
+---@param tool_call table
+---@param label_line number 1-based line holding the tool label
+---@return nil
+function ACPHandler:_render_failed_output(tool_call, label_line)
+  local err = formatter.error_lines(tool_call)
+  if #err == 0 then
+    return
+  end
+
+  local bufnr = self.chat.bufnr
+  self.chat.ui:unlock_buf()
+  vim.api.nvim_buf_set_lines(bufnr, label_line, label_line, false, err)
+  -- priority above treesitter (100) and below the status icons (120)
+  vim.api.nvim_buf_set_extmark(bufnr, ERROR_NS, label_line, 0, {
+    end_row = label_line + #err - 1,
+    end_col = #err[#err],
+    hl_group = "CodeCompanionChatToolError",
+    priority = 110,
+  })
+  self.chat.ui:lock_buf()
+end
+
 ---Output tool call to the chat
 ---@param tool_call table
 ---@return nil
 function ACPHandler:process_tool_call(tool_call)
   local id = tool_call.toolCallId
 
+  -- Render error output only on the transition into failed; agents may send
+  -- further updates for an already-failed call
+  local was_failed = self.tools[id] ~= nil and self.tools[id].status == "failed"
+
   local merged = merge_tool_call(self.tools[id], tool_call)
+
+  -- codex-acp 2.x sends command output only as `_meta.terminal_output_delta`
+  -- chunks, one per update; the merge replaces `_meta`, so append each chunk
+  local delta = vim.tbl_get(tool_call, "_meta", "terminal_output_delta", "data")
+  if type(delta) == "string" then
+    merged.streamed_output = (merged.streamed_output or "") .. delta
+  end
   tool_call = merged
 
   self:track_edits(id, tool_call)
@@ -375,6 +413,9 @@ function ACPHandler:process_tool_call(tool_call)
       elseif new_icon_id then
         cached.icon_id = new_icon_id
       end
+      if tool_call.status == "failed" and not was_failed then
+        self:_render_failed_output(tool_call, line_number)
+      end
       return
     end
 
@@ -396,6 +437,10 @@ function ACPHandler:process_tool_call(tool_call)
   })
 
   self.ui_state[id] = { line_number = line_number, icon_id = icon_id }
+
+  if tool_call.status == "failed" and not was_failed and line_number then
+    self:_render_failed_output(tool_call, line_number)
+  end
 end
 
 ---Queue a permission request and process when ready
