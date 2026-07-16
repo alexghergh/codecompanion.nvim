@@ -1,4 +1,5 @@
 local log = require("codecompanion.utils.log")
+local markdown = require("codecompanion.utils.markdown")
 local utils = require("codecompanion.utils")
 
 local approvals = require("codecompanion.interactions.chat.tools.approvals")
@@ -327,12 +328,23 @@ function M.confirm(chat, request)
   if not has_diff then
     local format = chat.adapter and chat.adapter.handlers and chat.adapter.handlers.format_permission_prompt
     local prompt = format and format(chat.adapter, tool_call)
-    prompt = prompt
-      or fmt(
-        "%s: %s",
-        utils.capitalize(tool_call and tool_call.kind or "Permission"),
-        tool_call and tool_call.title or "Agent requested permission"
-      )
+    if not prompt then
+      local kind = tool_call and tool_call.kind or "Permission"
+      local title = tool_call and tool_call.title or "Agent requested permission"
+      if kind == "execute" then
+        -- The raw (often multi-line) command travels in rawInput.command; the
+        -- title is only a human summary since claude-agent-acp 0.75 /
+        -- codex-acp 1.7 (and the command itself before that, hence the
+        -- fallback). Fence it so treesitter highlights it, mirroring the
+        -- fenced diffs in present_diff
+        local raw = tool_call and tool_call.rawInput
+        local command = type(raw) == "table" and type(raw.command) == "string" and raw.command ~= "" and raw.command
+          or title
+        prompt = "Execute:\n" .. markdown.form_codeblock(command, { ft = "bash" })
+      else
+        prompt = fmt("%s: %s", utils.capitalize(kind), title)
+      end
+    end
     return approve_in_chat(permission, choices, { prompt = prompt })
   end
 
