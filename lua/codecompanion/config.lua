@@ -1339,7 +1339,7 @@ The user is working on a %s machine. Please respond with system specific command
         tool_pending = "  ",
         tool_in_progress = "  ",
         tool_failure = "  ",
-        tool_success = "  ",
+        tool_success = "󰗡  ",
       },
 
       -- Window options for the chat buffer
