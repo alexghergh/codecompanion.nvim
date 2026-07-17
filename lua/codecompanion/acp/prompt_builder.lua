@@ -10,6 +10,7 @@ local utils = require("codecompanion.utils")
 ---@field handlers table
 ---@field options table
 ---@field _sent boolean
+---@field _pending_ids table<number, boolean> Request ids of in-flight turns (the initial prompt plus queued prompts)
 local PromptBuilder = {}
 PromptBuilder.__index = PromptBuilder
 
@@ -28,6 +29,7 @@ function PromptBuilder.new(connection, messages)
     ),
     options = {},
     _sent = false,
+    _pending_ids = {},
   }, { __index = PromptBuilder }) ---@cast self CodeCompanion.ACP.PromptBuilder
 
   return self
@@ -74,6 +76,10 @@ function PromptBuilder:on_cancel(fn)
   self.handlers.cancel = fn
   return self
 end
+function PromptBuilder:on_turn_done(fn)
+  self.handlers.turn_done = fn
+  return self
+end
 function PromptBuilder:with_options(opts)
   self.options = vim.tbl_extend("force", self.options, opts or {})
   return self
@@ -109,7 +115,7 @@ function PromptBuilder:send()
   -- Send the prompt
   local jsonrpc = require("codecompanion.utils.jsonrpc")
   local id = self.connection._state.id_gen:next()
-  self._request_id = id
+  self._pending_ids[id] = true
   local req = jsonrpc.request(id, self.connection.METHODS.SESSION_PROMPT, {
     sessionId = self.connection.session_id,
     prompt = self.messages,
@@ -123,6 +129,86 @@ function PromptBuilder:send()
       self:cancel()
     end,
   }
+end
+
+---Queue an additional user prompt while a turn is in flight. Requires an
+---agent that queues overlapping prompts (claude-agent-acp FIFOs them into
+---the session's turn queue); the queued turn's session updates stream into
+---this builder's handlers and completion fires only after the last pending
+---turn resolves.
+---@param messages table Messages in the shape form_messages expects
+---@return boolean sent Whether the request reached the agent process
+function PromptBuilder:queue_prompt(messages)
+  local jsonrpc = require("codecompanion.utils.jsonrpc")
+  local formed = self.connection.adapter.handlers.form_messages(
+    self.connection.adapter,
+    messages,
+    self.connection._agent_info.agentCapabilities
+  )
+  local id = self.connection._state.id_gen:next()
+  local req = jsonrpc.request(id, self.connection.METHODS.SESSION_PROMPT, {
+    sessionId = self.connection.session_id,
+    prompt = formed,
+  })
+  local sent = self.connection:write_message(self.connection.methods.encode(req) .. "\n")
+  if not sent then
+    log:error("[acp::prompt_builder] Failed to send queued prompt (request %s)", id)
+    return false
+  end
+  self._pending_ids[id] = true
+  log:debug("[acp::prompt_builder] Queued prompt sent (request %s)", id)
+  return true
+end
+
+---Whether this builder is waiting on the given request id
+---@param id number
+---@return boolean
+function PromptBuilder:owns_request(id)
+  return self._pending_ids[id] == true
+end
+
+---Handle a single turn's completion; the builder only finishes when no
+---queued turns remain
+---@param id number
+---@param stop_reason string
+---@return nil
+function PromptBuilder:handle_turn_done(id, stop_reason)
+  self._pending_ids[id] = nil
+  -- The raw session/prompt response was also stored for the sync polling
+  -- path, which never consumes it
+  self.connection.pending_responses[id] = nil
+  if next(self._pending_ids) then
+    if self.handlers.turn_done then
+      pcall(self.handlers.turn_done, stop_reason)
+    end
+    return
+  end
+  self:handle_done(stop_reason)
+end
+
+---Handle an error response to one of this builder's requests: a failed
+---queued prompt ends only its own turn; the last pending request's failure
+---ends the stretch. Errors for requests this builder does not own keep the
+---previous behavior of failing the active prompt.
+---@param id number
+---@param error_msg string
+---@return nil
+function PromptBuilder:handle_request_error(id, error_msg)
+  if not self._pending_ids[id] then
+    return self:handle_error(error_msg)
+  end
+
+  self._pending_ids[id] = nil
+  self.connection.pending_responses[id] = nil
+
+  if next(self._pending_ids) then
+    log:warn("[acp::prompt_builder] Queued prompt %s failed: %s", id, error_msg)
+    if self.handlers.turn_done then
+      pcall(self.handlers.turn_done, "error")
+    end
+    return
+  end
+  self:handle_error(error_msg)
 end
 
 ---Extract text from an ACP content block
@@ -253,7 +339,11 @@ function PromptBuilder:handle_error(error)
     utils.fire("RequestFinished", self.options)
   end
 
-  self.connection._active_prompt = nil
+  -- The error handler may synchronously install the next prompt (e.g. an
+  -- auto-submit inside chat:done()); only clear ownership while it's still ours
+  if self.connection._active_prompt == self then
+    self.connection._active_prompt = nil
+  end
 end
 
 ---Handle done event from the server
@@ -286,7 +376,11 @@ function PromptBuilder:handle_done(stop_reason)
     self.options.status = status
     utils.fire("RequestFinished", self.options)
   end
-  self.connection._active_prompt = nil
+  -- The complete handler may synchronously install the next prompt (e.g. the
+  -- btw auto-submit inside chat:done()); only clear ownership while it's still ours
+  if self.connection._active_prompt == self then
+    self.connection._active_prompt = nil
+  end
 end
 
 ---Cancel the prompt
@@ -309,7 +403,9 @@ function PromptBuilder:cancel()
     pcall(self.handlers.cancel)
   end
 
-  self.connection._active_prompt = nil
+  if self.connection._active_prompt == self then
+    self.connection._active_prompt = nil
+  end
 end
 
 PromptBuilder.new = PromptBuilder.new
