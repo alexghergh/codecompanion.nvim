@@ -37,7 +37,7 @@ local M = {}
 ---@return string|nil optionId
 local function find_reject_option(opts)
   for _, opt in ipairs(opts or {}) do
-    if opt.kind:find("^reject", 1, true) then
+    if type(opt.kind) == "string" and vim.startswith(opt.kind, "reject") then
       return opt.optionId
     end
   end
