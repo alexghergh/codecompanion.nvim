@@ -403,15 +403,19 @@ end
 T["ACP Responses"]["_handle_done when stopReason present"] = function()
   local result = child.lua([[
     local connection = create_test_connection()
-    local seen
+    local seen = {}
     connection._active_prompt = {
-      _request_id = 1,
-      handle_done = function(_, sr) seen = sr end
+      _pending_ids = { [1] = true },
+      owns_request = function(self, id) return self._pending_ids[id] == true end,
+      handle_turn_done = function(_, id, sr) seen[id] = sr end
     }
     connection:handle_rpc_message('{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}')
+    -- A response for a request this builder does not own must not dispatch
+    connection:handle_rpc_message('{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}')
     return seen
   ]])
-  h.eq(result, "end_turn")
+  h.eq(result[1], "end_turn")
+  h.eq(result[2], nil)
 end
 
 T["ACP Connection"]["_handle_exit resets state, calls on_exit and prompts done(canceled)"] = function()
@@ -783,6 +787,59 @@ T["ACP Responses"]["error response notifies active prompt"] = function()
 
   h.eq(result.error_handled, true)
   h.eq(result.error_message, "LLM provider error: quota exceeded")
+end
+
+T["ACP PromptBuilder"] = new_set()
+
+T["ACP PromptBuilder"]["terminal handlers only clear the active prompt they own"] = function()
+  local result = child.lua([[
+    local PromptBuilder = require("codecompanion.acp.prompt_builder")
+    local connection = {
+      adapter = { handlers = { form_messages = function(_, m) return m end } },
+      _agent_info = { agentCapabilities = {} },
+    }
+    local function builder()
+      return PromptBuilder.new(connection, {})
+    end
+
+    -- A terminal callback that synchronously installs the next prompt must
+    -- not have it clobbered by the finished builder's cleanup
+    local a, a_next = builder(), builder()
+    connection._active_prompt = a
+    a:on_complete(function() connection._active_prompt = a_next end)
+    a:handle_done("end_turn")
+    local after_done = connection._active_prompt == a_next
+
+    local b, b_next = builder(), builder()
+    connection._active_prompt = b
+    b:on_error(function() connection._active_prompt = b_next end)
+    b:handle_error("boom")
+    local after_error = connection._active_prompt == b_next
+
+    local c, c_next = builder(), builder()
+    connection._active_prompt = c
+    c:on_cancel(function() connection._active_prompt = c_next end)
+    c:cancel()
+    local after_cancel = connection._active_prompt == c_next
+
+    -- Still the owner: cleanup clears as before
+    local d = builder()
+    connection._active_prompt = d
+    d:handle_done("end_turn")
+    local cleared = connection._active_prompt == nil
+
+    return {
+      after_done = after_done,
+      after_error = after_error,
+      after_cancel = after_cancel,
+      cleared = cleared,
+    }
+  ]])
+
+  h.eq(result.after_done, true)
+  h.eq(result.after_error, true)
+  h.eq(result.after_cancel, true)
+  h.eq(result.cleared, true)
 end
 
 return T

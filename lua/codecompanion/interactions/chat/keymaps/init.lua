@@ -741,6 +741,69 @@ M.btw = {
   end,
 }
 
+-- Queue a message behind the in-flight turn (see Chat:queue_message); not
+-- bound by default - map it via config or a buffer-local keymap
+M.queue_message = {
+  desc = "Queue a message behind the streaming turn",
+  callback = function(chat)
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[buf].filetype = "markdown"
+    vim.bo[buf].bufhidden = "wipe"
+    -- the markdown ftplugin sets textwidth and would hard-wrap the input
+    vim.bo[buf].textwidth = 0
+
+    local width = math.max(60, math.floor(vim.o.columns * 0.6))
+    local height = 8
+    local win = vim.api.nvim_open_win(buf, true, {
+      relative = "editor",
+      width = width,
+      height = height,
+      row = math.floor((vim.o.lines - height) / 2) - 1,
+      col = math.floor((vim.o.columns - width) / 2),
+      style = "minimal",
+      border = "rounded",
+      title = " Queue message | <CR> (normal) sends | q cancels ",
+      title_pos = "center",
+    })
+    vim.wo[win].number = true
+    vim.wo[win].wrap = true
+    vim.wo[win].linebreak = true
+
+    local function close()
+      if vim.api.nvim_win_is_valid(win) then
+        vim.api.nvim_win_close(win, true)
+      end
+    end
+
+    vim.keymap.set("n", "<CR>", function()
+      local text = vim.trim(table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n"))
+      close()
+      if text == "" then
+        return
+      end
+      if chat.current_request then
+        return chat:queue_message(text)
+      end
+      -- No turn in flight: drop the text into the chat's input section. The
+      -- chat may have closed or locked (turn errored short of ready_for_input)
+      -- while the float was open
+      if not vim.api.nvim_buf_is_valid(chat.bufnr) then
+        return vim.notify("Chat buffer is gone; message not delivered", vim.log.levels.WARN)
+      end
+      if not vim.bo[chat.bufnr].modifiable then
+        vim.fn.setreg('"', text)
+        return vim.notify("Chat buffer is locked; message copied to the unnamed register", vim.log.levels.WARN)
+      end
+      local was_following = chat.ui:is_following()
+      chat:_append_below_tail(vim.split(text, "\n", { plain = true }))
+      chat.ui:move_cursor(was_following)
+    end, { buffer = buf, nowait = true })
+    vim.keymap.set("n", "q", close, { buffer = buf, nowait = true })
+
+    vim.cmd.startinsert()
+  end,
+}
+
 M.copilot_stats = {
   desc = "Show Copilot usage statistics",
   callback = function(chat)

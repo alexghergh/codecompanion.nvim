@@ -651,8 +651,9 @@ function Connection:handle_rpc_message(line)
   if message.id and not message.method then
     self:store_rpc_response(message)
     if message.result and message.result ~= vim.NIL and message.result.stopReason then
-      if self._active_prompt and self._active_prompt._request_id == message.id and self._active_prompt.handle_done then
-        self._active_prompt:handle_done(message.result.stopReason)
+      local prompt = self._active_prompt
+      if prompt and prompt.owns_request and prompt:owns_request(message.id) then
+        prompt:handle_turn_done(message.id, message.result.stopReason)
       end
     end
   elseif message.method then
@@ -678,7 +679,17 @@ function Connection:store_rpc_response(response)
       if response.error.data and response.error.data.error then
         error_msg = response.error.data.error
       end
-      self._active_prompt:handle_error(error_msg)
+      local prompt = self._active_prompt
+      if not prompt then
+        return
+      end
+      -- Route through the builder's per-request handler when available so a
+      -- failed queued prompt ends only its own turn, not the whole stretch
+      if prompt.handle_request_error then
+        prompt:handle_request_error(response.id, error_msg)
+      else
+        prompt:handle_error(error_msg)
+      end
     end)
   end
 
@@ -790,6 +801,27 @@ function Connection:write_message(data)
   end
 
   return true
+end
+
+---Whether the connected agent accepts overlapping session/prompt requests
+---(queueing them into the session's turn queue). ACP v1 has no standard
+---capability for this, so it is advertised under a vendor _meta namespace;
+---any vendor entry counts (claude-agent-acp sends
+---_meta.claudeCode.promptQueueing; codex-acp v0.14.0 and gemini-cli
+---advertise no such key, verified against their sources)
+---@return boolean
+function Connection:supports_prompt_queueing()
+  local caps = self._agent_info and self._agent_info.agentCapabilities
+  local meta = caps and caps._meta
+  if type(meta) ~= "table" then
+    return false
+  end
+  for _, vendor in pairs(meta) do
+    if type(vendor) == "table" and vendor.promptQueueing == true then
+      return true
+    end
+  end
+  return false
 end
 
 ---Check if params target the active session

@@ -38,6 +38,8 @@
 ---@field _acp_name_map_cache? table|false Memoised value -> display-name map for ACP select options; false means "computed, no entries"
 ---@field _btw? string The user's "by the way" message which is queued for sending to an LLM
 ---@field _compacting? boolean Whether a compaction request is currently in flight
+---@field _queued_marks? number[] FIFO of "[queued]" extmark ids for mid-stream queued messages
+---@field _queued_drafts? string[] Messages queued behind the turn for agents without mid-stream prompt queueing; popped into the input area at turn end
 ---@field _last_role string The last role that was rendered in the chat buffer
 ---@field _status table Bookkeeping for the current status virtual text (extmark id + status flag)
 ---@field _tool_monitors? table A table of tool monitors that are currently running in the chat buffer
@@ -86,6 +88,8 @@ local utils = require("codecompanion.utils")
 
 local api = vim.api
 local fmt = string.format
+
+local QUEUE_NS = api.nvim_create_namespace("CodeCompanion-queued_messages")
 
 local CONSTANTS = {
   AUTOCMD_GROUP = "codecompanion.chat",
@@ -1211,6 +1215,143 @@ function Chat:btw(content)
   log:debug("BTW message queued: %s", content)
 end
 
+---Queue a message behind the currently streaming turn. Agents that queue
+---overlapping prompts (see Connection:supports_prompt_queueing) receive it
+---immediately as an additional session/prompt; other adapters accumulate it
+---as a draft that pops into the input area at turn end. No-op when no turn
+---is in flight.
+---@param content string
+---@return nil
+function Chat:queue_message(content)
+  if not content or content == "" then
+    return
+  end
+  if not self.current_request then
+    return log:warn("[chat::queue_message] No turn in flight to queue behind")
+  end
+
+  local conn = self.acp_connection
+  local builder = conn and conn._active_prompt
+  local queueing = self.adapter.type == "acp"
+    and conn
+    and conn.supports_prompt_queueing
+    and conn:supports_prompt_queueing()
+
+  if not queueing or not builder or not builder.queue_prompt then
+    -- Turn-end fallback: accumulate in memory and pop into the input area under
+    -- a fresh ## Me header when the turn ends (see _flush_queued_drafts)
+    self._queued_drafts = self._queued_drafts or {}
+    table.insert(self._queued_drafts, content)
+    return log:debug("[chat::queue_message] Agent lacks prompt queueing; queued draft for turn end")
+  end
+
+  local sent = builder:queue_prompt({
+    { role = self.adapter.roles.user or config.constants.USER_ROLE, content = content, _meta = {} },
+  })
+
+  -- A message that never reached the agent process is no different from the
+  -- non-queueing fallback: queue it as a draft rather than adding it to the
+  -- message stack, where label_sent_items would flip it to sent at turn end
+  -- and stateful adapters would then never send it
+  if not sent then
+    self._queued_drafts = self._queued_drafts or {}
+    table.insert(self._queued_drafts, content)
+    return log:error("[chat::queue_message] Queued message not delivered; it pops into the input area at turn end")
+  end
+
+  self:add_message({ role = config.constants.USER_ROLE, content = content }, { _meta = { sent = true } })
+  self:_render_queued_message(content)
+  log:debug("[chat::queue_message] Queued prompt sent mid-turn")
+end
+
+---Append lines below the last non-blank buffer line, rewriting the trailing
+---blank run as a single separator
+---@param lines string[]
+---@return number # 0-based row of the first appended line
+function Chat:_append_below_tail(lines)
+  local buf_lines = api.nvim_buf_get_lines(self.bufnr, 0, -1, false)
+  local tail = #buf_lines
+  while tail > 0 and buf_lines[tail] == "" do
+    tail = tail - 1
+  end
+  api.nvim_buf_set_lines(self.bufnr, tail, -1, false, vim.list_extend({ "" }, lines))
+  return tail + 1
+end
+
+---Render a delivered queued message inline in the streaming section: no role
+---header, a full-line background distinguishes it from the agent's output.
+---Written directly to the buffer so it stays out of the builder's role/block
+---tracking and the turn keeps streaming below it.
+---@param content string
+---@return nil
+function Chat:_render_queued_message(content)
+  local lines = vim.split(content, "\n", { plain = true })
+
+  self.ui:unlock_buf()
+  local first = self:_append_below_tail(lines)
+  -- Trailing blank so the next streamed chunk does not continue on the
+  -- message's last line
+  api.nvim_buf_set_lines(self.bufnr, -1, -1, false, { "" })
+  for i = 0, #lines - 1 do
+    api.nvim_buf_set_extmark(self.bufnr, QUEUE_NS, first + i, 0, {
+      line_hl_group = "CodeCompanionChatQueuedMessage",
+      priority = 90,
+    })
+  end
+
+  self._queued_marks = self._queued_marks or {}
+  -- hl_mode combine: virt_text defaults to "replace", which paints the
+  -- marker cells with the default background, punching a hole through
+  -- cursorline and the queued-message line background
+  local mark = api.nvim_buf_set_extmark(self.bufnr, QUEUE_NS, first + #lines - 1, 0, {
+    virt_text = { { " [queued]", "NonText" } },
+    virt_text_pos = "eol",
+    hl_mode = "combine",
+  })
+  table.insert(self._queued_marks, mark)
+  self.ui:lock_buf()
+end
+
+---Clear the marker for the oldest queued message once its turn begins
+---@return nil
+function Chat:_queued_turn_started()
+  local marks = self._queued_marks
+  if not marks or #marks == 0 then
+    return
+  end
+  local mark = table.remove(marks, 1)
+  pcall(api.nvim_buf_del_extmark, self.bufnr, QUEUE_NS, mark)
+end
+
+---Pop messages queued behind the turn (agents without mid-stream prompt
+---queueing) into the input area under a fresh ## Me header, so the user can
+---edit them or press submit. Called from every terminal path in done(); a
+---closed buffer is the one accepted loss.
+---@return nil
+function Chat:_flush_queued_drafts()
+  local drafts = self._queued_drafts
+  if not drafts or #drafts == 0 then
+    return
+  end
+  self._queued_drafts = nil
+  if not api.nvim_buf_is_valid(self.bufnr) then
+    return
+  end
+
+  -- The empty-status exit returns from done() before ready_for_input opens a
+  -- user section; open one so the drafts land under a ## Me header whose mark
+  -- submit() tracks (a raw append below an LLM section is not parsed as user
+  -- text). The normal, cancel, and error exits already ran ready_for_input, so
+  -- _last_role is USER there and this is a no-op
+  if self._last_role ~= config.constants.USER_ROLE then
+    self:ready_for_input()
+  end
+  local was_following = self.ui:is_following()
+  self.ui:unlock_buf()
+  self:_append_below_tail(vim.split(table.concat(drafts, "\n\n"), "\n", { plain = true }))
+  self.ui:move_cursor(was_following)
+end
+
 ---Inject a btw message into the message stack
 ---@return nil
 function Chat:_inject_btw()
@@ -1527,6 +1668,16 @@ function Chat:done(output, reasoning, tools, meta, opts)
     return
   end
 
+  -- The turn stretch is over; any "[queued]" markers left (cancelled or
+  -- errored before their turn started) are stale. Delete by id: the same
+  -- namespace holds the permanent queued-message background marks
+  if self._queued_marks and #self._queued_marks > 0 then
+    for _, mark in ipairs(self._queued_marks) do
+      pcall(api.nvim_buf_del_extmark, self.bufnr, QUEUE_NS, mark)
+    end
+    self._queued_marks = {}
+  end
+
   self:_clear_status()
 
   if opts.status == "stopped" then
@@ -1551,6 +1702,7 @@ function Chat:done(output, reasoning, tools, meta, opts)
 
   -- Commonly, a status may not be set if the message exceeds a token limit
   if not self.status or self.status == "" then
+    self:_flush_queued_drafts()
     return self:reset()
   end
   local has_output = output and not vim.tbl_isempty(output)
@@ -1596,8 +1748,9 @@ function Chat:done(output, reasoning, tools, meta, opts)
     reasoning_content = nil
   end
 
-  -- If a user stops the request, we should be prepared to send the last message
-  -- again as we can't be sure what the LLM had actually received
+  -- On a stop after output has streamed, leave the message unsent so it can
+  -- be sent again - we can't be sure what the LLM actually received; a stop
+  -- before any output instead marks it sent (see the stopped path above)
   if not opts.status or opts.status ~= "stopped" then
     self:label_sent_items()
   end
@@ -1651,6 +1804,7 @@ function Chat:finish(opts)
   -- Captured first as `ready_for_input` resets the status to an empty string
   local status = self.status
   self:ready_for_input()
+  self:_flush_queued_drafts()
 
   self:dispatch("on_completed", { status = status, error = opts.error })
   utils.fire("ChatDone", { bufnr = self.bufnr, id = self.id })
@@ -1918,6 +2072,7 @@ end
 ---@param content string The new content for the line
 ---@param opts? table Optional parameters
 ---@return boolean success Whether the update was successful
+---@return number|nil icon_id The new status icon extmark id, if one was placed
 function Chat:update_buf_line(line_number, content, opts)
   assert(type(content) == "string", "content must be a string")
   opts = opts or {}
