@@ -376,12 +376,6 @@ function ACPHandler:process_tool_call(tool_call)
 
   self:flush_edits(id, tool_call)
 
-  -- Pending tool calls are awaiting approval or streaming input, so hold them
-  -- back from the buffer until the agent moves them out of the pending state
-  if tool_call.status == "pending" then
-    return
-  end
-
   local ok, content = pcall(formatter.tool_message, tool_call, self.chat.adapter)
   if not ok then
     content = "[Error formatting tool output]"
