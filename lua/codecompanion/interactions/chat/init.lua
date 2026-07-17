@@ -1265,7 +1265,9 @@ function Chat:queue_message(content)
 end
 
 ---Append lines below the last non-blank buffer line, rewriting the trailing
----blank run as a single separator
+---blank run as a single separator. Leaves the tail on content: the next
+---write supplies its own leading separator (the builder's seam rule for
+---streamed chunks, header spacing at turn end).
 ---@param lines string[]
 ---@return number # 0-based row of the first appended line
 function Chat:_append_below_tail(lines)
@@ -1289,9 +1291,6 @@ function Chat:_render_queued_message(content)
 
   self.ui:unlock_buf()
   local first = self:_append_below_tail(lines)
-  -- Trailing blank so the next streamed chunk does not continue on the
-  -- message's last line
-  api.nvim_buf_set_lines(self.bufnr, -1, -1, false, { "" })
   for i = 0, #lines - 1 do
     api.nvim_buf_set_extmark(self.bufnr, QUEUE_NS, first + i, 0, {
       line_hl_group = "CodeCompanionChatQueuedMessage",

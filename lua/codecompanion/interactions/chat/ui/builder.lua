@@ -17,6 +17,7 @@ local Icons = require("codecompanion.interactions.chat.ui.icons")
 local config = require("codecompanion.config")
 
 local api = vim.api
+local STREAM_TAIL_NS = api.nvim_create_namespace("CodeCompanion-stream_tail")
 
 -- The different types of blocks that are rendered in the chat buffer
 local BLOCK = { REASONING = "reasoning", LLM = "llm", TOOL = "tool" }
@@ -200,7 +201,49 @@ function Builder:add_message(data, opts)
     write.trailing_blanks = lines[2] == BLANK and 0 or 1
   end
 
+  if not role_changed and not opts.insert_at then
+    local delta = self:_normalize_foreign_tail(lines)
+    if delta then
+      write.trailing_blanks = nil
+      write.content_start = write.content_start + delta
+      if write.fold_info then
+        write.fold_info.start_offset = write.fold_info.start_offset + delta
+        write.fold_info.end_offset = write.fold_info.end_offset + delta
+      end
+    end
+  end
+
   return self:_write(lines, opts, write)
+end
+
+---Replace leading blanks with spacing derived from an out-of-band buffer tail
+---@param lines string[]
+---@return number|nil delta
+function Builder:_normalize_foreign_tail(lines)
+  if not self._tail_mark then
+    return nil
+  end
+
+  local bufnr = self.chat.bufnr
+  local pos = api.nvim_buf_get_extmark_by_id(bufnr, STREAM_TAIL_NS, self._tail_mark, {})
+  local tail_row = api.nvim_buf_line_count(bufnr) - 1
+  if not pos or pos[1] == nil or (pos[1] == tail_row and not self._tail_dirty) then
+    return nil
+  end
+
+  local stripped = 0
+  while lines[1] == BLANK do
+    table.remove(lines, 1)
+    stripped = stripped + 1
+  end
+
+  local tail_line = api.nvim_buf_get_lines(bufnr, tail_row, tail_row + 1, false)[1] or BLANK
+  local prefix = tail_line == BLANK and 1 or 2
+  for _ = 1, prefix do
+    table.insert(lines, 1, BLANK)
+  end
+
+  return prefix - stripped
 end
 
 ---Trim or pad the buffer's trailing blank lines
@@ -249,6 +292,17 @@ function Builder:_write(lines, opts, write)
   local was_following = self.chat.ui:is_following()
 
   api.nvim_buf_set_text(self.chat.bufnr, insert_line, column, insert_line, column, lines)
+
+  local end_line_written = insert_line + #lines - 1
+  if not opts.insert_at then
+    self._tail_mark = api.nvim_buf_set_extmark(self.chat.bufnr, STREAM_TAIL_NS, end_line_written, 0, {
+      id = self._tail_mark,
+      right_gravity = false,
+    })
+    self._tail_dirty = false
+  else
+    self._tail_dirty = true
+  end
 
   local icon_id = self:_apply_icon(insert_line, opts, write.content_start)
 
