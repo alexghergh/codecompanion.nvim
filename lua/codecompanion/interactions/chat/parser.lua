@@ -138,8 +138,46 @@ end
 ---Parse the chat buffer for the last message
 ---@param chat CodeCompanion.Chat
 ---@param start_range number
+---@param opts? { anchored: boolean } anchored: start_range came from the user header extmark
 ---@return { content: string }|nil
-function M.messages(chat, start_range)
+function M.messages(chat, start_range, opts)
+  -- The plugin writes the "## <user role>" header itself and anchors it with
+  -- an extmark; when start_range resolved from that mark, everything below
+  -- it is the user's message and is taken verbatim. Re-detecting the
+  -- boundary with the section query would treat any H2 the user typed (e.g.
+  -- a literal "## Me") as a role header, swallowing the line and dropping
+  -- the content that follows it. A bare user header without the mark (a
+  -- restored chat, a hand-typed header) is not enough: the typed section
+  -- may sit below an older one
+  local header = vim.api.nvim_buf_get_lines(chat.bufnr, start_range - 1, start_range, false)[1]
+  if
+    opts
+    and opts.anchored
+    and header
+    and header:sub(1, 3) == "## "
+    and helpers.format_role(header:sub(4)) == config.interactions.chat.roles.user
+  then
+    local lines = vim.api.nvim_buf_get_lines(chat.bufnr, start_range, -1, false)
+    -- Context renders as ">"-prefixed lines below a leading blank; skip
+    -- blanks first or the strip below never engages and context leaks into
+    -- the message
+    local i = 1
+    while lines[i] == "" do
+      i = i + 1
+    end
+    while lines[i] and lines[i]:sub(1, 1) == ">" do
+      i = i + 1
+    end
+    local text = vim.trim(table.concat(vim.list_slice(lines, i), "\n"))
+    if text ~= "" then
+      return { content = text }
+    end
+    return nil
+  end
+
+  -- The anchor row does not hold a user header (restored chat ending in an
+  -- LLM section, a hand-typed recovery header after the plugin failed to
+  -- open a section): walk the markdown sections
   local query = markdown_chat_query()
 
   local tree = chat.parsers.markdown:parse({ start_range - 1, -1 })[1]
