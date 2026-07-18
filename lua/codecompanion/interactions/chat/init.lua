@@ -90,6 +90,7 @@ local api = vim.api
 local fmt = string.format
 
 local QUEUE_NS = api.nvim_create_namespace("CodeCompanion-queued_messages")
+local HEADER_NS = api.nvim_create_namespace("CodeCompanion-user_header")
 
 local CONSTANTS = {
   AUTOCMD_GROUP = "codecompanion.chat",
@@ -684,8 +685,10 @@ function Chat.new(args)
     self.ui:render(self.buffer_context, self.messages, { stop_context_insertion = args.stop_context_insertion })
   end
 
-  -- For restored chats, locate the last user header via Tree-sitter once
-  if args.messages and vim.tbl_count(args.messages) > 0 then
+  -- Anchor the user header while the buffer holds only plugin-rendered
+  -- content; for restored chats whose buffer ends in an LLM section no mark
+  -- is placed and the last user header row still seeds the parse fallback
+  if not self:_anchor_user_header() and args.messages and vim.tbl_count(args.messages) > 0 then
     local header_line = parser.headers(self)
     self.header_line = header_line and (header_line + 1) or 1
   end
@@ -1502,6 +1505,63 @@ Shorten it, or edit it from the debug window]],
   return true
 end
 
+---Anchor the user header with an extmark so message parsing survives buffer
+---edits above it. Scans for the last H2 in the buffer and places the mark
+---only when that header belongs to the user; any other shape leaves the
+---anchor unset and message parsing falls back to the Tree-sitter walk.
+---@return boolean anchored
+function Chat:_anchor_user_header()
+  local lines = api.nvim_buf_get_lines(self.bufnr, 0, -1, false)
+  for i = #lines, 1, -1 do
+    local line = lines[i]
+    if line:sub(1, 3) == "## " then
+      if helpers.format_role(line:sub(4)) == config.interactions.chat.roles.user then
+        self.header_line = i
+        self:_mark_user_header(i - 1)
+        return true
+      end
+      return false
+    end
+  end
+  return false
+end
+
+---Place (or move) the user-header mark on a row. Default (right) gravity so
+---an insertion at exactly the mark position shifts the mark along with the
+---header line it tracks, instead of leaving it on the inserted content
+---@param row number 0-based
+---@return nil
+function Chat:_mark_user_header(row)
+  self._header_mark = api.nvim_buf_set_extmark(self.bufnr, HEADER_NS, row, 0, {
+    id = self._header_mark,
+  })
+end
+
+---Resolve the current row of the user header from its mark
+---@return number|nil row 1-based, nil when no mark is set
+function Chat:_user_header_row()
+  if not self._header_mark then
+    return nil
+  end
+  local pos = api.nvim_buf_get_extmark_by_id(self.bufnr, HEADER_NS, self._header_mark, {})
+  if pos and pos[1] ~= nil then
+    return pos[1] + 1
+  end
+  return nil
+end
+
+---Drop the user-header mark once submit has consumed the section. The next
+---section's mark is placed by ready_for_input; while no mark exists (a user
+---hand-types a recovery header after the plugin failed to open a section),
+---message parsing falls back to the Tree-sitter walk that honors typed headers
+---@return nil
+function Chat:_consume_user_header()
+  if self._header_mark then
+    api.nvim_buf_del_extmark(self.bufnr, HEADER_NS, self._header_mark)
+    self._header_mark = nil
+  end
+end
+
 ---Submit the chat buffer's contents to the LLM
 ---@param opts? table
 ---@return nil
@@ -1533,7 +1593,15 @@ function Chat:submit(opts)
       return
     end
   else
-    local message_to_submit = parser.messages(self, self.header_line)
+    -- The numeric header_line goes stale when the buffer is edited above the
+    -- header; the mark tracks those shifts, so message parsing and the
+    -- context and image scans below all start from its current row
+    local header_row = self:_user_header_row()
+    if header_row then
+      self.header_line = header_row
+    end
+
+    local message_to_submit = parser.messages(self, self.header_line, { anchored = header_row ~= nil })
     if not message_to_submit and not helpers.has_user_messages(self.messages) then
       return log:warn("No messages to submit")
     end
@@ -1592,6 +1660,7 @@ function Chat:submit(opts)
 
     self.ui:resume_following()
     self.ui:lock_buf()
+    self:_consume_user_header()
     self.header_line = api.nvim_buf_line_count(self.bufnr) + 2 -- this accounts for the LLM header
 
     -- Allow users to send a btw message during an active request
@@ -2149,7 +2218,11 @@ function Chat:ready_for_input(opts)
     self.cycle = self.cycle + 1
     self:add_buf_message({ role = config.constants.USER_ROLE, content = "" })
 
-    self.header_line = (self.builder.state.current_header_line or 0) + 1
+    local header_row = self.builder.state.current_header_line
+    self.header_line = (header_row or 0) + 1
+    if header_row then
+      self:_mark_user_header(header_row)
+    end
     self.ui:display_tokens({ parser = self.parsers.markdown, start_row = self.header_line, tokens = self.tokens })
     self.context:render()
 
@@ -2206,6 +2279,9 @@ function Chat:clear()
 
   log:trace("Clearing chat buffer")
   self.ui:render(self.buffer_context, self.messages, self.opts):set_intro_msg(self.intro_message)
+  -- The full-buffer rewrite collapsed the old mark to row 0; re-anchor on the
+  -- freshly rendered header
+  self:_anchor_user_header()
   self:set_system_prompt()
   utils.fire("ChatCleared", { bufnr = self.bufnr, id = self.id })
 end
