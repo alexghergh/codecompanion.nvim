@@ -50,7 +50,7 @@ local function format_session(session)
   end
 
   if session.title then
-    table.insert(parts, session.title)
+    table.insert(parts, vim.trim(session.title:gsub("%s+", " ")))
   else
     table.insert(parts, session.sessionId)
   end
