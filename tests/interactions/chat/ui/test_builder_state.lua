@@ -110,6 +110,26 @@ T["Builder state"]["tool fold is placed on the content line when the tool messag
   h.eq(res.fold.type, "tool")
 end
 
+T["Builder state"]["keeps adjacent tool messages on consecutive lines"] = function()
+  child.lua([[
+    _G.chat:add_buf_message(
+      { role = "llm", content = "Execute: first" },
+      { type = _G.MT.TOOL_MESSAGE, status = "completed" }
+    )
+    _G.chat:add_buf_message(
+      { role = "llm", content = "Think: second" },
+      { type = _G.MT.TOOL_MESSAGE, status = "completed" }
+    )
+  ]])
+
+  local lines = child.lua_get([[vim.api.nvim_buf_get_lines(_G.chat.bufnr, 0, -1, true)]])
+  local first_tool = vim.fn.index(lines, "Execute: first")
+  local second_tool = vim.fn.index(lines, "Think: second")
+
+  h.not_eq(first_tool, -1)
+  h.eq(first_tool + 1, second_tool)
+end
+
 T["Builder"] = new_set()
 
 T["Builder"]["a status write is collapsed onto a single line"] = function()
