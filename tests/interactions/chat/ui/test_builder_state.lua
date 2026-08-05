@@ -112,22 +112,33 @@ end
 
 T["Builder state"]["keeps adjacent tool messages on consecutive lines"] = function()
   child.lua([[
-    _G.chat:add_buf_message(
+    local first_line, first_icon = _G.chat:add_buf_message(
       { role = "llm", content = "Execute: first" },
-      { type = _G.MT.TOOL_MESSAGE, status = "completed" }
+      { type = _G.MT.TOOL_MESSAGE, status = "pending" }
     )
-    _G.chat:add_buf_message(
+    _G.chat:update_buf_line(first_line, "Execute: first", { status = "completed", icon_id = first_icon })
+
+    local second_line, second_icon = _G.chat:add_buf_message(
       { role = "llm", content = "Think: second" },
-      { type = _G.MT.TOOL_MESSAGE, status = "completed" }
+      { type = _G.MT.TOOL_MESSAGE, status = "pending" }
+    )
+    _G.chat:update_buf_line(second_line, "Think: second", { status = "completed", icon_id = second_icon })
+
+    _G.chat:add_buf_message({ role = "llm", content = "\n" }, { type = _G.MT.LLM_MESSAGE })
+    _G.chat:add_buf_message(
+      { role = "llm", content = "Execute: third" },
+      { type = _G.MT.TOOL_MESSAGE, status = "pending" }
     )
   ]])
 
   local lines = child.lua_get([[vim.api.nvim_buf_get_lines(_G.chat.bufnr, 0, -1, true)]])
   local first_tool = vim.fn.index(lines, "Execute: first")
   local second_tool = vim.fn.index(lines, "Think: second")
+  local third_tool = vim.fn.index(lines, "Execute: third")
 
   h.not_eq(first_tool, -1)
   h.eq(first_tool + 1, second_tool)
+  h.eq(second_tool + 1, third_tool)
 end
 
 T["Builder"] = new_set()

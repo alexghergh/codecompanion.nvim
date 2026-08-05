@@ -173,6 +173,9 @@ function Builder:add_message(data, opts)
           table.remove(content_lines, 1)
         end
       end
+      if not role_changed and vim.tbl_isempty(content_lines) then
+        return nil
+      end
     end
 
     write.content_start = #lines
