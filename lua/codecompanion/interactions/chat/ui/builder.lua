@@ -45,7 +45,7 @@ local SEPARATORS = {
   [BLOCK.TOOL] = {
     [BLOCK.REASONING] = { BLANK, SUBHEADER.REASONING, BLANK },
     [BLOCK.LLM] = { BLANK },
-    [BLOCK.TOOL] = { BLANK },
+    [BLOCK.TOOL] = {},
   },
 }
 
@@ -198,7 +198,7 @@ function Builder:add_message(data, opts)
 
   -- If the line has a blank line at the end, don't add an additional one
   if starts_new_line then
-    write.trailing_blanks = lines[2] == BLANK and 0 or 1
+    write.trailing_blanks = prev_block == BLOCK.TOOL and block == BLOCK.TOOL and 0 or (lines[2] == BLANK and 0 or 1)
   end
 
   if not role_changed and not opts.insert_at then
