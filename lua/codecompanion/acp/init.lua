@@ -46,7 +46,7 @@ local uv = vim.uv
 ---@field chat? CodeCompanion.Chat
 ---@field pending_responses table<number, CodeCompanion.ACP.Connection.PendingResponse>
 ---@field session_id string|nil
----@field _agent_info {agentCapabilities: ACP.agentCapabilities, authMethods: ACP.authMethods, protocolVersion: number}|nil
+---@field _agent_info {agentCapabilities: ACP.agentCapabilities, authMethods: ACP.authMethods, protocolVersion: number, _meta?: table}|nil
 ---@field _initialized boolean
 ---@field _authenticated boolean
 ---@field _active_prompt CodeCompanion.ACP.PromptBuilder|nil
@@ -56,6 +56,7 @@ local uv = vim.uv
 ---@field _config_options table[] Raw configOptions from the agent
 ---@field _in_flight table<string, CodeCompanion.ACP.Connection.InFlight> Establishment steps currently underway
 ---@field _pending_callbacks table<number, function> Async callbacks keyed by request ID
+---@field _steering_ids table<number, boolean> In-flight _session/steering request ids; their errors bypass the active prompt
 ---@field _rpc_log? { path: string, write: fun(data: string) } Per-connection log capturing raw JSON-RPC traffic
 ---@field methods table
 local Connection = {}
@@ -106,6 +107,7 @@ function Connection.new(args)
     _initialized = false,
     _pending_callbacks = {},
     _state = { handle = nil, id_gen = jsonrpc.IdGenerator.new(), line_buffer = jsonrpc.LineBuffer.new() },
+    _steering_ids = {},
   }, { __index = Connection }) ---@cast self CodeCompanion.ACP.Connection
 
   return self
@@ -670,8 +672,14 @@ end
 ---Handles the response to the request
 ---@param response table
 function Connection:store_rpc_response(response)
+  -- A failed steering request recovers through the chat's draft queue; it
+  -- must not end the streaming turn (handle_request_error fails the whole
+  -- prompt for ids the builder does not own); captured before the callback
+  -- runs, which clears the id
+  local steering = self._steering_ids[response.id] == true
+
   local function forward_error_to_prompt()
-    if not response.error or not self._active_prompt or not self._active_prompt.handle_error then
+    if not response.error or steering or not self._active_prompt or not self._active_prompt.handle_error then
       return
     end
     self.methods.schedule(function()
@@ -822,6 +830,46 @@ function Connection:supports_prompt_queueing()
     end
   end
   return false
+end
+
+---Whether the connected agent accepts mid-turn steering (_session/steering
+---injects a prompt into the running turn). A codex-acp extension advertised
+---in the initialize response's top-level _meta, not under the
+---agentCapabilities._meta vendor namespace claude-agent-acp uses for
+---promptQueueing
+---@return boolean
+function Connection:supports_steering()
+  local meta = self._agent_info and self._agent_info._meta
+  local steering = type(meta) == "table" and meta.steering or nil
+  return type(steering) == "table" and steering.supported == true
+end
+
+---Steer the active session's running turn with an additional user prompt.
+---The callback receives the agent's outcome ("injected" when the prompt
+---joined the running turn, "startedNewTurn" when it ran as a fresh turn
+---agent-side, "failed") or nil when the request errors or the process dies
+---@param messages table Messages in the shape form_messages expects
+---@param callback fun(outcome: string|nil)
+---@return boolean sent Whether the request reached the agent process
+function Connection:steer(messages, callback)
+  if not self.session_id then
+    return false
+  end
+  local prompt = self.adapter.handlers.form_messages(self.adapter, messages, self._agent_info.agentCapabilities)
+  local id = self._state.id_gen:next()
+  local req = jsonrpc.request(id, METHODS.SESSION_STEERING, {
+    sessionId = self.session_id,
+    prompt = prompt,
+  })
+  if not self:write_message(self.methods.encode(req) .. "\n") then
+    return false
+  end
+  self._steering_ids[id] = true
+  self._pending_callbacks[id] = function(result)
+    self._steering_ids[id] = nil
+    callback(type(result) == "table" and result.outcome or nil)
+  end
+  return true
 end
 
 ---Check if params target the active session
@@ -976,6 +1024,7 @@ function Connection:handle_process_exit(code, signal)
   self._authenticated = false
   self._initialized = false
   self._pending_callbacks = {}
+  self._steering_ids = {}
   self.pending_responses = {}
   self.session_id = nil
 
