@@ -842,4 +842,103 @@ T["ACP PromptBuilder"]["terminal handlers only clear the active prompt they own"
   h.eq(result.cleared, true)
 end
 
+T["ACP Steering"] = new_set()
+
+T["ACP Steering"]["supports_steering reads the initialize response top-level _meta"] = function()
+  local result = child.lua([[
+    local connection = create_test_connection()
+    local no_info = connection:supports_steering()
+
+    connection._agent_info = { _meta = { steering = { supported = true } }, agentCapabilities = {} }
+    local advertised = connection:supports_steering()
+
+    -- claude's vendor namespace under agentCapabilities must not count
+    connection._agent_info = { agentCapabilities = { _meta = { steering = { supported = true } } } }
+    local wrong_location = connection:supports_steering()
+
+    connection._agent_info = { _meta = { steering = { supported = false } }, agentCapabilities = {} }
+    local unsupported = connection:supports_steering()
+
+    return {
+      no_info = no_info,
+      advertised = advertised,
+      wrong_location = wrong_location,
+      unsupported = unsupported,
+    }
+  ]])
+  h.eq(result.no_info, false)
+  h.eq(result.advertised, true)
+  h.eq(result.wrong_location, false)
+  h.eq(result.unsupported, false)
+end
+
+T["ACP Steering"]["steer sends _session/steering and routes the outcome to the callback"] = function()
+  local result = child.lua([[
+    local connection = create_test_connection({ schedule = function(fn) fn() end })
+    connection.session_id = "sess-1"
+    connection._agent_info = { agentCapabilities = {} }
+    local written
+    connection._state.handle = { write = function(_, data) written = data end }
+
+    local outcome
+    local sent = connection:steer(
+      { { role = "user", content = "hello" } },
+      function(o) outcome = o end
+    )
+    local req = vim.json.decode(written)
+    connection:handle_rpc_message(vim.json.encode({
+      jsonrpc = "2.0",
+      id = req.id,
+      result = { outcome = "injected" },
+    }))
+
+    return {
+      sent = sent,
+      method = req.method,
+      session = req.params.sessionId,
+      outcome = outcome,
+      cleared = connection._steering_ids[req.id] == nil,
+    }
+  ]])
+  h.eq(result.sent, true)
+  h.eq(result.method, "_session/steering")
+  h.eq(result.session, "sess-1")
+  h.eq(result.outcome, "injected")
+  h.eq(result.cleared, true)
+end
+
+T["ACP Steering"]["a steering error resolves the callback without failing the active prompt"] = function()
+  local result = child.lua([[
+    local connection = create_test_connection({ schedule = function(fn) fn() end })
+    connection.session_id = "sess-1"
+    connection._agent_info = { agentCapabilities = {} }
+    local written
+    connection._state.handle = { write = function(_, data) written = data end }
+
+    local prompt_failed = false
+    connection._active_prompt = {
+      handle_error = function() prompt_failed = true end,
+      handle_request_error = function() prompt_failed = true end,
+    }
+
+    local outcome = "unset"
+    connection:steer({ { role = "user", content = "hello" } }, function(o) outcome = o end)
+    local req = vim.json.decode(written)
+    connection:handle_rpc_message(vim.json.encode({
+      jsonrpc = "2.0",
+      id = req.id,
+      error = { code = -32602, message = "The current model does not support image input" },
+    }))
+
+    return {
+      prompt_failed = prompt_failed,
+      outcome_nil = outcome == nil,
+      cleared = connection._steering_ids[req.id] == nil,
+    }
+  ]])
+  h.eq(result.prompt_failed, false)
+  h.eq(result.outcome_nil, true)
+  h.eq(result.cleared, true)
+end
+
 return T

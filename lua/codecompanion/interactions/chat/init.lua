@@ -1220,9 +1220,10 @@ end
 
 ---Queue a message behind the currently streaming turn. Agents that queue
 ---overlapping prompts (see Connection:supports_prompt_queueing) receive it
----immediately as an additional session/prompt; other adapters accumulate it
----as a draft that pops into the input area at turn end. No-op when no turn
----is in flight.
+---immediately as an additional session/prompt; agents that steer (see
+---Connection:supports_steering) get it injected into the running turn via
+---_session/steering; other adapters accumulate it as a draft that pops into
+---the input area at turn end. No-op when no turn is in flight.
 ---@param content string
 ---@return nil
 function Chat:queue_message(content)
@@ -1233,38 +1234,86 @@ function Chat:queue_message(content)
     return log:warn("[chat::queue_message] No turn in flight to queue behind")
   end
 
-  local conn = self.acp_connection
+  local conn = self.adapter.type == "acp" and self.acp_connection or nil
   local builder = conn and conn._active_prompt
-  local queueing = self.adapter.type == "acp"
-    and conn
+
+  if
+    conn
     and conn.supports_prompt_queueing
     and conn:supports_prompt_queueing()
+    and builder
+    and builder.queue_prompt
+  then
+    local sent = builder:queue_prompt({
+      { role = self.adapter.roles.user or config.constants.USER_ROLE, content = content, _meta = {} },
+    })
 
-  if not queueing or not builder or not builder.queue_prompt then
-    -- Turn-end fallback: accumulate in memory and pop into the input area under
-    -- a fresh ## Me header when the turn ends (see _flush_queued_drafts)
-    self._queued_drafts = self._queued_drafts or {}
-    table.insert(self._queued_drafts, content)
-    return log:debug("[chat::queue_message] Agent lacks prompt queueing; queued draft for turn end")
+    -- A message that never reached the agent process is no different from the
+    -- non-queueing fallback: queue it as a draft rather than adding it to the
+    -- message stack, where label_sent_items would flip it to sent at turn end
+    -- and stateful adapters would then never send it
+    if not sent then
+      self:_queue_draft(content)
+      return log:error("[chat::queue_message] Queued message not delivered; it pops into the input area at turn end")
+    end
+
+    self:add_message({ role = config.constants.USER_ROLE, content = content }, { _meta = { sent = true } })
+    self:_render_queued_message(content)
+    return log:debug("[chat::queue_message] Queued prompt sent mid-turn")
   end
 
-  local sent = builder:queue_prompt({
+  if conn and conn.supports_steering and conn:supports_steering() then
+    return self:_steer_message(conn, content)
+  end
+
+  -- Turn-end fallback: accumulate in memory and pop into the input area under
+  -- a fresh ## Me header when the turn ends (see _flush_queued_drafts)
+  self:_queue_draft(content)
+  log:debug("[chat::queue_message] Agent lacks mid-stream delivery; queued draft for turn end")
+end
+
+---Steer the running turn with a mid-stream message (codex _session/steering).
+---Presented like the queueing transport: rendered inline at send with the
+---[queued] marker. The async outcome then settles it: "injected" joined the
+---running turn, so clear the marker and record the message as sent; anything
+---else - "failed", a "startedNewTurn" the agent runs outside this builder's
+---handlers, an error, process death - removes the render and recovers the
+---text through the draft queue, immediately when the turn already ended,
+---else at turn end
+---@param conn CodeCompanion.ACP.Connection
+---@param content string
+---@return nil
+function Chat:_steer_message(conn, content)
+  local render
+  local sent = conn:steer({
     { role = self.adapter.roles.user or config.constants.USER_ROLE, content = content, _meta = {} },
-  })
+  }, function(outcome)
+    if outcome == "injected" then
+      self:add_message({ role = config.constants.USER_ROLE, content = content }, { _meta = { sent = true } })
+      self:_queued_turn_started()
+      return log:debug("[chat::queue_message] Steering message injected mid-turn")
+    end
+    self:_remove_queued_render(render)
+    self:_queue_draft(content)
+    if not self.current_request then
+      self:_flush_queued_drafts()
+    end
+    log:warn("[chat::queue_message] Steering outcome %s; message pops into the input area", outcome or "error")
+  end)
 
-  -- A message that never reached the agent process is no different from the
-  -- non-queueing fallback: queue it as a draft rather than adding it to the
-  -- message stack, where label_sent_items would flip it to sent at turn end
-  -- and stateful adapters would then never send it
   if not sent then
-    self._queued_drafts = self._queued_drafts or {}
-    table.insert(self._queued_drafts, content)
-    return log:error("[chat::queue_message] Queued message not delivered; it pops into the input area at turn end")
+    self:_queue_draft(content)
+    return log:error("[chat::queue_message] Steering message not delivered; it pops into the input area at turn end")
   end
+  render = self:_render_queued_message(content)
+end
 
-  self:add_message({ role = config.constants.USER_ROLE, content = content }, { _meta = { sent = true } })
-  self:_render_queued_message(content)
-  log:debug("[chat::queue_message] Queued prompt sent mid-turn")
+---Accumulate a message for the turn-end draft pop (see _flush_queued_drafts)
+---@param content string
+---@return nil
+function Chat:_queue_draft(content)
+  self._queued_drafts = self._queued_drafts or {}
+  table.insert(self._queued_drafts, content)
 end
 
 ---Append lines below the last non-blank buffer line, rewriting the trailing
@@ -1288,14 +1337,15 @@ end
 ---Written directly to the buffer so it stays out of the builder's role/block
 ---tracking and the turn keeps streaming below it.
 ---@param content string
----@return nil
+---@return { hl: number[], eol: number } # extmarks identifying the render for _remove_queued_render
 function Chat:_render_queued_message(content)
   local lines = vim.split(content, "\n", { plain = true })
 
   self.ui:unlock_buf()
   local first = self:_append_below_tail(lines)
+  local hl = {}
   for i = 0, #lines - 1 do
-    api.nvim_buf_set_extmark(self.bufnr, QUEUE_NS, first + i, 0, {
+    hl[#hl + 1] = api.nvim_buf_set_extmark(self.bufnr, QUEUE_NS, first + i, 0, {
       line_hl_group = "CodeCompanionChatQueuedMessage",
       priority = 90,
     })
@@ -1312,9 +1362,13 @@ function Chat:_render_queued_message(content)
   })
   table.insert(self._queued_marks, mark)
   self.ui:lock_buf()
+  return { hl = hl, eol = mark }
 end
 
----Clear the marker for the oldest queued message once its turn begins
+---Clear the marker for the oldest queued message once its delivery settles:
+---its turn beginning for queued prompts, the injected outcome for steering.
+---Responses arrive in send order for both transports, so oldest-first pairs
+---markers with their messages
 ---@return nil
 function Chat:_queued_turn_started()
   local marks = self._queued_marks
@@ -1323,6 +1377,39 @@ function Chat:_queued_turn_started()
   end
   local mark = table.remove(marks, 1)
   pcall(api.nvim_buf_del_extmark, self.bufnr, QUEUE_NS, mark)
+end
+
+---Remove an optimistically rendered queued message whose delivery failed,
+---together with the separator blank _append_below_tail wrote above it. The
+---extmarks track the rendered rows as the buffer grows; nothing is written
+---between the separator and the message, so the blank is always the line
+---above the first mark
+---@param render { hl: number[], eol: number }
+---@return nil
+function Chat:_remove_queued_render(render)
+  if not api.nvim_buf_is_valid(self.bufnr) then
+    return
+  end
+  local first = api.nvim_buf_get_extmark_by_id(self.bufnr, QUEUE_NS, render.hl[1], {})
+  local last = api.nvim_buf_get_extmark_by_id(self.bufnr, QUEUE_NS, render.hl[#render.hl], {})
+  if #first == 0 or #last == 0 then
+    return
+  end
+  for i = #(self._queued_marks or {}), 1, -1 do
+    if self._queued_marks[i] == render.eol then
+      table.remove(self._queued_marks, i)
+    end
+  end
+
+  self.ui:unlock_buf()
+  -- delete the marks before the lines so a line_hl does not slide onto a
+  -- surviving neighbor
+  for _, id in ipairs(render.hl) do
+    api.nvim_buf_del_extmark(self.bufnr, QUEUE_NS, id)
+  end
+  api.nvim_buf_del_extmark(self.bufnr, QUEUE_NS, render.eol)
+  api.nvim_buf_set_lines(self.bufnr, first[1] - 1, last[1] + 1, false, {})
+  self.ui:lock_buf()
 end
 
 ---Pop messages queued behind the turn (agents without mid-stream prompt
