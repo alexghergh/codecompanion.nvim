@@ -389,7 +389,7 @@ function Connection:session_delete(session_id)
 end
 
 ---List previous sessions from the agent
----@param opts? { max_sessions?: number }
+---@param opts? { max_sessions?: number, cwd?: string|false } cwd=false omits the filter, listing sessions from every directory
 ---@return table[] sessions Array of SessionInfo objects
 function Connection:session_list(opts)
   opts = opts or {}
@@ -404,7 +404,10 @@ function Connection:session_list(opts)
   local cursor = nil
 
   repeat
-    local params = { cwd = vim.fn.getcwd() }
+    local params = {}
+    if opts.cwd ~= false then
+      params.cwd = opts.cwd or vim.fn.getcwd()
+    end
     if cursor then
       params.cursor = cursor
     end
