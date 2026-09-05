@@ -365,6 +365,29 @@ function Connection:can_load_session()
     or false
 end
 
+---Check if the agent supports session/delete
+---@return boolean
+function Connection:can_delete_session()
+  return self._agent_info
+      and self._agent_info.agentCapabilities
+      and self._agent_info.agentCapabilities.sessionCapabilities
+      and self._agent_info.agentCapabilities.sessionCapabilities.delete ~= nil
+    or false
+end
+
+---Delete a session from the agent's persisted history
+---@param session_id string
+---@return boolean success
+function Connection:session_delete(session_id)
+  if not self:is_ready() then
+    log:error("[acp::session_delete] Connection not ready")
+    return false
+  end
+
+  local result = self:send_rpc_request(METHODS.SESSION_DELETE, { sessionId = session_id })
+  return result ~= nil
+end
+
 ---List previous sessions from the agent
 ---@param opts? { max_sessions?: number }
 ---@return table[] sessions Array of SessionInfo objects
