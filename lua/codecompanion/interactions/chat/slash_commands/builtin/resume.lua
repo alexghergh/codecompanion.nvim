@@ -38,8 +38,9 @@ end
 
 ---Format a session for display in the picker
 ---@param session table SessionInfo
+---@param show_dir? boolean Append the session's directory, for lists that span directories
 ---@return string
-local function format_session(session)
+local function format_session(session, show_dir)
   local parts = {}
 
   if session.updatedAt then
@@ -47,6 +48,12 @@ local function format_session(session)
     if ts then
       table.insert(parts, "(" .. utils.make_relative(ts) .. ")")
     end
+  end
+
+  -- the directory sits ahead of the title: pickers truncate long lines at the
+  -- window edge, so the variable-length title must come last
+  if show_dir and type(session.cwd) == "string" and session.cwd ~= "" then
+    table.insert(parts, "[" .. vim.fn.pathshorten(vim.fn.fnamemodify(session.cwd, ":~")) .. "]")
   end
 
   if session.title then
@@ -89,8 +96,13 @@ function SlashCommand:execute()
     return utils.notify("No ACP connection available", vim.log.levels.WARN)
   end
 
+  -- cwd=false lists sessions from every directory, a string overrides the directory to filter by
+  local cwd = self.config.opts and self.config.opts.cwd
+  local all_dirs = cwd == false
+
   local sessions = Chat.acp_connection:session_list({
     max_sessions = (self.config.opts and self.config.opts.max_sessions) or 500,
+    cwd = cwd,
   })
 
   if #sessions == 0 then
@@ -100,12 +112,12 @@ function SlashCommand:execute()
   local choices = {}
   local session_map = {}
   for i, session in ipairs(sessions) do
-    table.insert(choices, format_session(session))
+    table.insert(choices, format_session(session, all_dirs))
     session_map[i] = session
   end
 
   vim.ui.select(choices, {
-    prompt = "Resume Session",
+    prompt = all_dirs and "Resume Session (all directories)" or "Resume Session",
     kind = "codecompanion.nvim",
   }, function(_, idx)
     if not idx then
