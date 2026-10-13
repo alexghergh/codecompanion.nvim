@@ -39,6 +39,7 @@
 ---@field _btw? string The user's "by the way" message which is queued for sending to an LLM
 ---@field _compacting? boolean Whether a compaction request is currently in flight
 ---@field _queued_marks? number[] FIFO of "[queued]" extmark ids for mid-stream queued messages
+---@field _queued_pending? table<number, { render: table, content: string }> Unsettled queued prompts by their "[queued]" extmark id
 ---@field _queued_drafts? string[] Messages queued behind the turn for agents without mid-stream prompt queueing; popped into the input area at turn end
 ---@field _last_role string The last role that was rendered in the chat buffer
 ---@field _status table Bookkeeping for the current status virtual text (extmark id + status flag)
@@ -1258,7 +1259,10 @@ function Chat:queue_message(content)
     end
 
     self:add_message({ role = config.constants.USER_ROLE, content = content }, { _meta = { sent = true } })
-    self:_render_queued_message(content)
+    local render = self:_render_queued_message(content)
+    -- kept until the prompt settles, so a cancel can take the message back
+    self._queued_pending = self._queued_pending or {}
+    self._queued_pending[render.eol] = { render = render, content = content }
     return log:debug("[chat::queue_message] Queued prompt sent mid-turn")
   end
 
@@ -1365,17 +1369,40 @@ function Chat:_render_queued_message(content)
   return { hl = hl, eol = mark }
 end
 
----Clear the marker for the oldest queued message once its delivery settles:
----its turn beginning for queued prompts, the injected outcome for steering.
----Responses arrive in send order for both transports, so oldest-first pairs
----markers with their messages
+---Settle the oldest queued message: clear its marker when its turn begins
+---(queued prompts) or it is injected (steering). Responses arrive in send
+---order for both transports, so oldest-first pairs markers with their
+---messages. A queued prompt the agent cancels before its turn starts never
+---reached the model (claude-agent-acp drops it from Claude Code's queue
+---before interrupting, since 0.86.0), so its text goes back to the user:
+---the inline render and the stack entry are removed and the text is queued
+---as a draft for done() to flush into the input area
+---@param stop_reason? string
 ---@return nil
-function Chat:_queued_turn_started()
+function Chat:_queued_turn_started(stop_reason)
   local marks = self._queued_marks
   if not marks or #marks == 0 then
     return
   end
-  local mark = table.remove(marks, 1)
+  local mark = marks[1]
+  local pending = self._queued_pending and self._queued_pending[mark]
+  if stop_reason == "cancelled" and pending then
+    self._queued_pending[mark] = nil
+    self:_remove_queued_render(pending.render)
+    for i = #self.messages, 1, -1 do
+      local msg = self.messages[i]
+      if msg.role == config.constants.USER_ROLE and msg.content == pending.content then
+        table.remove(self.messages, i)
+        break
+      end
+    end
+    self:_queue_draft(pending.content)
+    return log:debug("[chat::queue_message] Queued prompt cancelled before its turn; message pops into the input area")
+  end
+  table.remove(marks, 1)
+  if pending then
+    self._queued_pending[mark] = nil
+  end
   pcall(api.nvim_buf_del_extmark, self.bufnr, QUEUE_NS, mark)
 end
 
@@ -1831,6 +1858,7 @@ function Chat:done(output, reasoning, tools, meta, opts)
       pcall(api.nvim_buf_del_extmark, self.bufnr, QUEUE_NS, mark)
     end
     self._queued_marks = {}
+    self._queued_pending = nil
   end
 
   self:_clear_status()
