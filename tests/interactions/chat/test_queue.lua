@@ -163,6 +163,49 @@ T["queue"]["delivered mid-stream message is marked sent and not restored"] = fun
   h.eq(false, out.restored)
 end
 
+T["queue"]["queued message cancelled before its turn is restored as a draft"] = function()
+  local out = child.lua([[
+    local chat = _G.chat
+    chat.adapter.type = "acp"
+    chat.acp_connection = {
+      supports_prompt_queueing = function() return true end,
+      _active_prompt = { queue_prompt = function() return true end },
+      get_models = function() return nil end,
+      build_name_map = function() return nil end,
+      get_config_options = function() return {} end,
+    }
+    chat:add_buf_message({ role = "llm", content = "streamed answer" })
+    chat:queue_message("never ran")
+
+    -- the agent dropped the queued prompt on cancel and answered it first
+    chat:_queued_turn_started("cancelled")
+    local in_stack = false
+    for _, msg in ipairs(chat.messages) do
+      if msg.content == "never ran" then
+        in_stack = true
+      end
+    end
+    local inline = table.concat(vim.api.nvim_buf_get_lines(chat.bufnr, 0, -1, false), "\n")
+
+    chat._last_role = "llm"
+    chat.status = "success"
+    chat:done(nil, nil, nil, nil, { status = "stopped" })
+
+    local row = chat:_user_header_row() or chat.header_line
+    local msg = parser.messages(chat, row)
+    return {
+      in_stack = in_stack,
+      inline_removed = inline:find("never ran", 1, true) == nil,
+      drained = chat._queued_drafts == nil,
+      recovered = (msg and msg.content or ""):find("never ran", 1, true) ~= nil,
+    }
+  ]])
+  h.eq(false, out.in_stack)
+  h.eq(true, out.inline_removed)
+  h.eq(true, out.drained)
+  h.eq(true, out.recovered)
+end
+
 T["queue"]["no queued drafts leaves turn end unchanged"] = function()
   local out = child.lua([[
     local chat = _G.chat
