@@ -214,4 +214,54 @@ T["Keymaps"]["change_adapter"]["list_acp_models returns nil when < 2 models"] = 
   h.expect_truthy(result)
 end
 
+T["Keymaps"]["close"] = new_set({
+  hooks = {
+    pre_case = function()
+      child.lua([[
+        _G.chat = h.setup_chat_buffer()
+        keymaps = require("codecompanion.interactions.chat.keymaps")
+        _G.confirm_calls = 0
+        vim.fn.confirm = function()
+          _G.confirm_calls = _G.confirm_calls + 1
+          return _G.confirm_answer
+        end
+      ]])
+    end,
+    post_case = function()
+      child.lua([[h.teardown_chat_buffer()]])
+    end,
+  },
+})
+
+T["Keymaps"]["close"]["closes a chat with no unsent text without asking"] = function()
+  local out = child.lua([[
+    local bufnr = _G.chat.bufnr
+    keymaps.close.callback(_G.chat)
+    return { asked = _G.confirm_calls, open = vim.api.nvim_buf_is_valid(bufnr) }
+  ]])
+  h.eq({ asked = 0, open = false }, out)
+end
+
+T["Keymaps"]["close"]["keeps a chat with unsent text open when the user says no"] = function()
+  local out = child.lua([[
+    local bufnr = _G.chat.bufnr
+    vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { "an unsent draft" })
+    _G.confirm_answer = 2
+    keymaps.close.callback(_G.chat)
+    return { asked = _G.confirm_calls, open = vim.api.nvim_buf_is_valid(bufnr) }
+  ]])
+  h.eq({ asked = 1, open = true }, out)
+end
+
+T["Keymaps"]["close"]["closes a chat with unsent text when the user says yes"] = function()
+  local out = child.lua([[
+    local bufnr = _G.chat.bufnr
+    vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { "an unsent draft" })
+    _G.confirm_answer = 1
+    keymaps.close.callback(_G.chat)
+    return { asked = _G.confirm_calls, open = vim.api.nvim_buf_is_valid(bufnr) }
+  ]])
+  h.eq({ asked = 1, open = false }, out)
+end
+
 return T

@@ -1,6 +1,7 @@
 local async = require("plenary.async")
 local completion = require("codecompanion.providers.completion")
 local config = require("codecompanion.config")
+local parser = require("codecompanion.interactions.chat.parser")
 local triggers = require("codecompanion.triggers")
 
 local ts = require("codecompanion.utils.treesitter")
@@ -333,8 +334,22 @@ local function chat_cycle_filter()
   end
 end
 
+---@param chat CodeCompanion.Chat
+---@return boolean
+local function has_unsent_text(chat)
+  local header_row = chat:_user_header_row()
+  local message = parser.messages(chat, header_row or chat.header_line, { anchored = header_row ~= nil })
+  return message ~= nil and vim.trim(message.content or "") ~= ""
+end
+
 M.close = {
   callback = function(chat)
+    if
+      has_unsent_text(chat) and vim.fn.confirm("Close the chat and discard the unsent message?", "&Yes\n&No", 2) ~= 1
+    then
+      return
+    end
+
     local winnr
     if chat.ui:is_visible() and not chat.ui:is_visible_non_curtab() then
       winnr = chat.ui.winnr
