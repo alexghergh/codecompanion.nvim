@@ -38,8 +38,8 @@
 ---@field _acp_name_map_cache? table|false Memoised value -> display-name map for ACP select options; false means "computed, no entries"
 ---@field _btw? string The user's "by the way" message which is queued for sending to an LLM
 ---@field _compacting? boolean Whether a compaction request is currently in flight
----@field _queued_marks? number[] FIFO of "[queued]" extmark ids for mid-stream queued messages
----@field _queued_pending? table<number, { render: table, content: string }> Unsettled queued prompts by their "[queued]" extmark id
+---@field _queued? { content: string, kind: "prompt"|"steer" }[] Mid-stream messages the agent has not picked up yet, oldest first
+---@field _queue_preview_attached? boolean Whether the buffer listener that keeps the queue preview at the bottom is attached
 ---@field _queued_drafts? string[] Messages queued behind the turn for agents without mid-stream prompt queueing; popped into the input area at turn end
 ---@field _last_role string The last role that was rendered in the chat buffer
 ---@field _status table Bookkeeping for the current status virtual text (extmark id + status flag)
@@ -91,6 +91,58 @@ local api = vim.api
 local fmt = string.format
 
 local QUEUE_NS = api.nvim_create_namespace("CodeCompanion-queued_messages")
+local QUEUE_PREVIEW_NS = api.nvim_create_namespace("CodeCompanion-queued_preview")
+local QUEUE_ARROW = "\226\134\179 "
+local QUEUE_PREVIEW_MAX_MESSAGES = 2
+local QUEUE_PREVIEW_MAX_ROWS = 2
+
+---@param color number
+---@param base number
+---@param weight number
+---@return number
+local function blend(color, base, weight)
+  local mixed = 0
+  for shift = 0, 16, 8 do
+    local channel = bit.band(bit.rshift(color, shift), 0xff) * weight
+      + bit.band(bit.rshift(base, shift), 0xff) * (1 - weight)
+    mixed = bit.bor(mixed, bit.lshift(math.floor(channel + 0.5), shift))
+  end
+  return mixed
+end
+
+---Split text into rows no wider than the given number of characters
+---@param text string
+---@param width number
+---@return string[]
+local function wrap_to_width(text, width)
+  local rows = {}
+  for _, line in ipairs(vim.split(text, "\n", { plain = true })) do
+    repeat
+      local row = vim.fn.strcharpart(line, 0, width)
+      line = vim.fn.strcharpart(line, vim.fn.strchars(row))
+      table.insert(rows, row)
+    until line == ""
+  end
+  return rows
+end
+
+---Define the waiting-message highlight, unless already set: dim italic text on a background darker than the editor's
+---@return nil
+local function set_queue_preview_highlight()
+  if next(api.nvim_get_hl(0, { name = "CodeCompanionChatQueuedPending" })) then
+    return
+  end
+  -- the dim attribute arrived in Neovim 0.12
+  if vim.fn.has("nvim-0.12") == 0 then
+    return api.nvim_set_hl(0, "CodeCompanionChatQueuedPending", { link = "Comment" })
+  end
+  local normal_bg = api.nvim_get_hl(0, { name = "Normal", link = false }).bg
+  api.nvim_set_hl(0, "CodeCompanionChatQueuedPending", {
+    bg = normal_bg and blend(normal_bg, 0x000000, 0.75),
+    italic = true,
+    dim = true,
+  })
+end
 local HEADER_NS = api.nvim_create_namespace("CodeCompanion-user_header")
 
 local CONSTANTS = {
@@ -1259,10 +1311,7 @@ function Chat:queue_message(content)
     end
 
     self:add_message({ role = config.constants.USER_ROLE, content = content }, { _meta = { sent = true } })
-    local render = self:_render_queued_message(content)
-    -- kept until the prompt settles, so a cancel can take the message back
-    self._queued_pending = self._queued_pending or {}
-    self._queued_pending[render.eol] = { render = render, content = content }
+    self:_add_to_queue({ content = content, kind = "prompt" })
     return log:debug("[chat::queue_message] Queued prompt sent mid-turn")
   end
 
@@ -1277,27 +1326,30 @@ function Chat:queue_message(content)
 end
 
 ---Steer the running turn with a mid-stream message (codex _session/steering).
----Presented like the queueing transport: rendered inline at send with the
----[queued] marker. The async outcome then settles it: "injected" joined the
----running turn, so clear the marker and record the message as sent; anything
----else - "failed", a "startedNewTurn" the agent runs outside this builder's
----handlers, an error, process death - removes the render and recovers the
----text through the draft queue, immediately when the turn already ended,
+---Shown in the queue preview until the async outcome settles it: "injected"
+---joined the running turn, so the message is written into the chat and
+---recorded as sent; anything else - "failed", a "startedNewTurn" the agent
+---runs outside this builder's handlers, an error, process death - recovers
+---the text through the draft queue, immediately when the turn already ended,
 ---else at turn end
 ---@param conn CodeCompanion.ACP.Connection
 ---@param content string
 ---@return nil
 function Chat:_steer_message(conn, content)
-  local render
+  local entry = { content = content, kind = "steer" }
   local sent = conn:steer({
     { role = self.adapter.roles.user or config.constants.USER_ROLE, content = content, _meta = {} },
   }, function(outcome)
+    self:_remove_from_queue(entry)
     if outcome == "injected" then
       self:add_message({ role = config.constants.USER_ROLE, content = content }, { _meta = { sent = true } })
-      self:_queued_turn_started()
+      -- after turn end the tail is the user's input section, where the text
+      -- would be parsed and sent again
+      if self.current_request then
+        self:_render_queued_message(content)
+      end
       return log:debug("[chat::queue_message] Steering message injected mid-turn")
     end
-    self:_remove_queued_render(render)
     self:_queue_draft(content)
     if not self.current_request then
       self:_flush_queued_drafts()
@@ -1309,7 +1361,7 @@ function Chat:_steer_message(conn, content)
     self:_queue_draft(content)
     return log:error("[chat::queue_message] Steering message not delivered; it pops into the input area at turn end")
   end
-  render = self:_render_queued_message(content)
+  self:_add_to_queue(entry)
 end
 
 ---Accumulate a message for the turn-end draft pop (see _flush_queued_drafts)
@@ -1336,107 +1388,215 @@ function Chat:_append_below_tail(lines)
   return tail + 1
 end
 
----Render a delivered queued message inline in the streaming section: no role
----header, a full-line background distinguishes it from the agent's output.
----Written directly to the buffer so it stays out of the builder's role/block
----tracking and the turn keeps streaming below it.
+---Write a queued message into the chat once the agent picks it up.
+---No role header; a full-line background sets it apart from the agent's
+---output. Written directly to the buffer so it stays out of the builder's
+---role/block tracking and the turn keeps streaming below it.
 ---@param content string
----@return { hl: number[], eol: number } # extmarks identifying the render for _remove_queued_render
+---@return nil
 function Chat:_render_queued_message(content)
   local lines = vim.split(content, "\n", { plain = true })
 
   self.ui:unlock_buf()
   local first = self:_append_below_tail(lines)
-  local hl = {}
   for i = 0, #lines - 1 do
-    hl[#hl + 1] = api.nvim_buf_set_extmark(self.bufnr, QUEUE_NS, first + i, 0, {
+    api.nvim_buf_set_extmark(self.bufnr, QUEUE_NS, first + i, 0, {
       line_hl_group = "CodeCompanionChatQueuedMessage",
       priority = 90,
     })
   end
-
-  self._queued_marks = self._queued_marks or {}
-  -- hl_mode combine: virt_text defaults to "replace", which paints the
-  -- marker cells with the default background, punching a hole through
-  -- cursorline and the queued-message line background
-  local mark = api.nvim_buf_set_extmark(self.bufnr, QUEUE_NS, first + #lines - 1, 0, {
-    virt_text = { { " [queued]", "NonText" } },
-    virt_text_pos = "eol",
-    hl_mode = "combine",
-  })
-  table.insert(self._queued_marks, mark)
   self.ui:lock_buf()
-  return { hl = hl, eol = mark }
 end
 
----Settle the oldest queued message: clear its marker when its turn begins
----(queued prompts) or it is injected (steering). Responses arrive in send
----order for both transports, so oldest-first pairs markers with their
----messages. A queued prompt the agent cancels before its turn starts never
----reached the model (claude-agent-acp drops it from Claude Code's queue
----before interrupting, since 0.86.0), so its text goes back to the user:
----the inline render and the stack entry are removed and the text is queued
----as a draft for done() to flush into the input area
----@param stop_reason? string
+---@param entry { content: string, kind: "prompt"|"steer" }
 ---@return nil
-function Chat:_queued_turn_started(stop_reason)
-  local marks = self._queued_marks
-  if not marks or #marks == 0 then
-    return
-  end
-  local mark = marks[1]
-  local pending = self._queued_pending and self._queued_pending[mark]
-  if stop_reason == "cancelled" and pending then
-    self._queued_pending[mark] = nil
-    self:_remove_queued_render(pending.render)
-    for i = #self.messages, 1, -1 do
-      local msg = self.messages[i]
-      if msg.role == config.constants.USER_ROLE and msg.content == pending.content then
-        table.remove(self.messages, i)
-        break
-      end
+function Chat:_add_to_queue(entry)
+  self._queued = self._queued or {}
+  table.insert(self._queued, entry)
+  self:_render_queue_preview()
+end
+
+---@param entry { content: string, kind: "prompt"|"steer" }
+---@return nil
+function Chat:_remove_from_queue(entry)
+  for i, queued in ipairs(self._queued or {}) do
+    if queued == entry then
+      table.remove(self._queued, i)
+      break
     end
-    self:_queue_draft(pending.content)
-    return log:debug("[chat::queue_message] Queued prompt cancelled before its turn; message pops into the input area")
   end
-  table.remove(marks, 1)
-  if pending then
-    self._queued_pending[mark] = nil
-  end
-  pcall(api.nvim_buf_del_extmark, self.bufnr, QUEUE_NS, mark)
+  self:_render_queue_preview()
 end
 
----Remove an optimistically rendered queued message whose delivery failed,
----together with the separator blank _append_below_tail wrote above it. The
----extmarks track the rendered rows as the buffer grows; nothing is written
----between the separator and the message, so the blank is always the line
----above the first mark
----@param render { hl: number[], eol: number }
+---Show the messages the agent has not picked up yet as virtual lines below the last buffer line
 ---@return nil
-function Chat:_remove_queued_render(render)
+function Chat:_render_queue_preview()
   if not api.nvim_buf_is_valid(self.bufnr) then
     return
   end
-  local first = api.nvim_buf_get_extmark_by_id(self.bufnr, QUEUE_NS, render.hl[1], {})
-  local last = api.nvim_buf_get_extmark_by_id(self.bufnr, QUEUE_NS, render.hl[#render.hl], {})
-  if #first == 0 or #last == 0 then
+  api.nvim_buf_clear_namespace(self.bufnr, QUEUE_PREVIEW_NS, 0, -1)
+  self._queue_preview_height = nil
+  if not self._queued or #self._queued == 0 then
     return
   end
-  for i = #(self._queued_marks or {}), 1, -1 do
-    if self._queued_marks[i] == render.eol then
-      table.remove(self._queued_marks, i)
-    end
+
+  local win = vim.fn.bufwinid(self.bufnr)
+  local width = 80
+  if win ~= -1 then
+    width = api.nvim_win_get_width(win) - vim.fn.getwininfo(win)[1].textoff
   end
 
-  self.ui:unlock_buf()
-  -- delete the marks before the lines so a line_hl does not slide onto a
-  -- surviving neighbor
-  for _, id in ipairs(render.hl) do
-    api.nvim_buf_del_extmark(self.bufnr, QUEUE_NS, id)
+  -- virtual lines neither wrap nor take a line background, so wrap by hand
+  -- and pad every row to the window width
+  set_queue_preview_highlight()
+  local text_width = width - 2
+  local function add_row(virt_lines, text)
+    local padding = string.rep(" ", math.max(width - vim.fn.strdisplaywidth(text), 0))
+    table.insert(virt_lines, { { text .. padding, "CodeCompanionChatQueuedPending" } })
   end
-  api.nvim_buf_del_extmark(self.bufnr, QUEUE_NS, render.eol)
-  api.nvim_buf_set_lines(self.bufnr, first[1] - 1, last[1] + 1, false, {})
-  self.ui:lock_buf()
+
+  -- capped so the preview always fits in the window below the last line
+  local virt_lines = {}
+  for index = 1, math.min(#self._queued, QUEUE_PREVIEW_MAX_MESSAGES) do
+    table.insert(virt_lines, { { "", "Normal" } })
+    local rows = wrap_to_width(self._queued[index].content, text_width)
+    for row_index = 1, math.min(#rows, QUEUE_PREVIEW_MAX_ROWS) do
+      local row = rows[row_index]
+      if row_index == QUEUE_PREVIEW_MAX_ROWS and #rows > QUEUE_PREVIEW_MAX_ROWS then
+        row = vim.fn.strcharpart(row, 0, text_width - 3) .. "..."
+      end
+      add_row(virt_lines, (row_index == 1 and QUEUE_ARROW or "  ") .. row)
+    end
+  end
+  local hidden = #self._queued - QUEUE_PREVIEW_MAX_MESSAGES
+  if hidden > 0 then
+    add_row(virt_lines, fmt("  +%d more queued", hidden))
+  end
+
+  api.nvim_buf_set_extmark(self.bufnr, QUEUE_PREVIEW_NS, api.nvim_buf_line_count(self.bufnr) - 1, 0, {
+    virt_lines = virt_lines,
+  })
+  self._queue_preview_height = #virt_lines
+  self:_scroll_to_queue_preview()
+  self:_keep_queue_preview_at_bottom()
+end
+
+---Scroll past the last line far enough to show the queue preview, while the cursor follows the output
+---@return nil
+function Chat:_scroll_to_queue_preview()
+  local win = vim.fn.bufwinid(self.bufnr)
+  if win == -1 or not self._queue_preview_height or not self.ui:is_following() then
+    return
+  end
+  -- Neovim never scrolls virtual lines below the last line into view by
+  -- itself; with `end_row` given, the height count leaves them out
+  local last = api.nvim_buf_line_count(self.bufnr)
+  -- getwininfo's height leaves out the winbar; nvim_win_get_height does not
+  local available = vim.fn.getwininfo(win)[1].height - self._queue_preview_height
+  api.nvim_win_call(win, function()
+    -- Walk up one screen row at a time: a closed fold is a single row, and measuring one line at a time
+    -- keeps the highlighter, which nvim_win_text_height runs, from parsing more than that line
+    ---@param line number
+    ---@return number first_line, number height
+    local function measure(line)
+      local fold_start = vim.fn.foldclosed(line)
+      if fold_start ~= -1 then
+        return fold_start, 1
+      end
+      return line, api.nvim_win_text_height(win, { start_row = line - 1, end_row = line - 1 }).all
+    end
+
+    local top, used = measure(last)
+    while top > 1 do
+      local first_line, height = measure(top - 1)
+      if used + height > available then
+        break
+      end
+      top, used = first_line, used + height
+    end
+
+    if vim.fn.line("w0") < top then
+      vim.fn.winrestview({ topline = top })
+    end
+  end)
+end
+
+---Keep the queue preview below the last line as the buffer grows, and in view as the cursor reaches the end
+---@return nil
+function Chat:_keep_queue_preview_at_bottom()
+  if self._queue_preview_attached then
+    return
+  end
+  self._queue_preview_attached = true
+  local group = api.nvim_create_augroup("codecompanion.queue_preview." .. self.bufnr, { clear = true })
+  api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
+    group = group,
+    buffer = self.bufnr,
+    callback = function()
+      self:_scroll_to_queue_preview()
+    end,
+  })
+  local scheduled = false
+  api.nvim_buf_attach(self.bufnr, false, {
+    on_lines = function()
+      if not self._queued or #self._queued == 0 then
+        self._queue_preview_attached = nil
+        pcall(api.nvim_del_augroup_by_id, group)
+        return true
+      end
+      -- extmarks cannot be moved safely while the buffer is mid-change
+      if not scheduled then
+        scheduled = true
+        vim.schedule(function()
+          scheduled = false
+          self:_render_queue_preview()
+        end)
+      end
+    end,
+  })
+end
+
+---Settle the queued prompts when the turn before them ends.
+---A queued prompt the agent cancels before its turn starts never reached the
+---model (claude-agent-acp drops it from Claude Code's queue before
+---interrupting, since 0.86.0), so its text goes back to the user as a draft
+---for done() to flush into the input area
+---@param stop_reason? string
+---@return nil
+function Chat:_queued_turn_started(stop_reason)
+  local prompts = vim.tbl_filter(function(queued)
+    return queued.kind == "prompt"
+  end, self._queued or {})
+  if #prompts == 0 then
+    return
+  end
+
+  if stop_reason == "cancelled" then
+    self:_remove_from_queue(prompts[1])
+    self:_hand_back_queued_prompt(prompts[1])
+    return log:debug("[chat::queue_message] Queued prompt cancelled before its turn; message pops into the input area")
+  end
+
+  -- Claude Code takes in every queued prompt at once, but claude-agent-acp only answers the turn it handed
+  -- over from (it never reports the others being taken in), so every waiting prompt has started
+  for _, entry in ipairs(prompts) do
+    self:_remove_from_queue(entry)
+    self:_render_queued_message(entry.content)
+  end
+end
+
+---Take a queued prompt that never ran off the message stack and queue its text as a draft
+---@param entry { content: string, kind: "prompt"|"steer" }
+---@return nil
+function Chat:_hand_back_queued_prompt(entry)
+  for i = #self.messages, 1, -1 do
+    local msg = self.messages[i]
+    if msg.role == config.constants.USER_ROLE and msg.content == entry.content then
+      table.remove(self.messages, i)
+      break
+    end
+  end
+  self:_queue_draft(entry.content)
 end
 
 ---Pop messages queued behind the turn (agents without mid-stream prompt
@@ -1850,16 +2010,19 @@ function Chat:done(output, reasoning, tools, meta, opts)
     return
   end
 
-  -- The turn stretch is over; any "[queued]" markers left (cancelled or
-  -- errored before their turn started) are stale. Delete by id: the same
-  -- namespace holds the permanent queued-message background marks
-  if self._queued_marks and #self._queued_marks > 0 then
-    for _, mark in ipairs(self._queued_marks) do
-      pcall(api.nvim_buf_del_extmark, self.bufnr, QUEUE_NS, mark)
+  -- Every queued prompt that ran settled on its own turn end, so one still
+  -- waiting here never ran: Chat:stop() finishes the chat before the agent
+  -- reports it cancelled. Steering messages stay queued until their own
+  -- outcome arrives
+  for _, entry in ipairs(self._queued or {}) do
+    if entry.kind == "prompt" then
+      self:_hand_back_queued_prompt(entry)
     end
-    self._queued_marks = {}
-    self._queued_pending = nil
   end
+  self._queued = vim.tbl_filter(function(entry)
+    return entry.kind == "steer"
+  end, self._queued or {})
+  self:_render_queue_preview()
 
   self:_clear_status()
 
