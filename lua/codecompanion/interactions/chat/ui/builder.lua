@@ -294,7 +294,17 @@ function Builder:_write(lines, opts, write)
   local column = opts.insert_at and 0 or last_column
   local was_following = self.chat.ui:is_following()
 
-  api.nvim_buf_set_text(self.chat.bufnr, insert_line, column, insert_line, column, lines)
+  -- A write that opens with a blank only adds lines; appending them below the last line, rather than
+  -- splitting it, leaves that line unchanged so a fold or extmark ending on it keeps it
+  local appends_below = not opts.insert_at
+    and #lines > 1
+    and lines[1] == BLANK
+    and column == #api.nvim_buf_get_lines(self.chat.bufnr, insert_line, insert_line + 1, false)[1]
+  if appends_below then
+    api.nvim_buf_set_lines(self.chat.bufnr, insert_line + 1, insert_line + 1, false, vim.list_slice(lines, 2))
+  else
+    api.nvim_buf_set_text(self.chat.bufnr, insert_line, column, insert_line, column, lines)
+  end
 
   local end_line_written = insert_line + #lines - 1
   if not opts.insert_at then
