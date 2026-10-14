@@ -121,6 +121,32 @@ T["ACPHandler"]["handles streaming message chunks"] = function()
   h.eq("llm_message", result.message_type)
 end
 
+T["ACPHandler"]["starts a new paragraph when the agent starts a NEW message"] = function()
+  local contents = child.lua([[
+    local chat = h.setup_chat_buffer({}, {
+      name = "test_acp",
+      config = {
+        name = "test_acp",
+        type = "acp",
+        handlers = { form_messages = function(a, m) return m end }
+      }
+    })
+    local handler = require("codecompanion.interactions.chat.acp.handler").new(chat)
+
+    local contents = {}
+    chat.add_buf_message = function(self, data)
+      table.insert(contents, data.content)
+    end
+
+    handler:handle_message_chunk("I'll check ", { message_id = "msg_1" })
+    handler:handle_message_chunk("the time.", { message_id = "msg_1" })
+    handler:handle_message_chunk("It's 1 PM.", { message_id = "msg_2" })
+    return contents
+  ]])
+
+  h.eq({ "I'll check ", "the time.", "\n\nIt's 1 PM." }, contents)
+end
+
 T["ACPHandler"]["handles thought chunks"] = function()
   local result = child.lua([[
     local chat = h.setup_chat_buffer({}, {

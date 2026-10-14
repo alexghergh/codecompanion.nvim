@@ -261,7 +261,7 @@ function PromptBuilder:handle_session_update(params)
     if self.handlers.message_chunk then
       local text = extract_text(params.content)
       if text and text ~= "" then
-        self.handlers.message_chunk(text)
+        self.handlers.message_chunk(text, { message_id = params.messageId })
       end
     end
   elseif params.sessionUpdate == "agent_thought_chunk" then
