@@ -396,7 +396,10 @@ function ACPHandler:_render_output(id, tool_call, label_line)
   vim.api.nvim_buf_clear_namespace(bufnr, OUTPUT_NS, label_line, label_line + previous.count)
   -- Delete before inserting: replacing lines in place keeps the old fold, so each update would nest another
   vim.api.nvim_buf_set_lines(bufnr, label_line, label_line + previous.count, false, {})
-  vim.api.nvim_buf_set_lines(bufnr, label_line, label_line, false, block)
+  -- Parallel tool calls write their labels first, so the output lands right above the next label
+  local next_line = vim.api.nvim_buf_get_lines(bufnr, label_line, label_line + 1, false)[1]
+  local spacer = next_line ~= nil and next_line ~= "" and { "" } or {}
+  vim.api.nvim_buf_set_lines(bufnr, label_line, label_line, false, vim.list_extend(vim.list_slice(block), spacer))
   -- priority above treesitter (100) and below the status icons (120)
   vim.api.nvim_buf_set_extmark(bufnr, OUTPUT_NS, label_line, 0, {
     end_row = label_line + #block - 1,
@@ -419,7 +422,7 @@ function ACPHandler:_render_output(id, tool_call, label_line)
   if folded then
     folds:create_output_fold(bufnr, fold_row, label_line + #block - 1, { hl_group = hl_group, open = was_open })
   end
-  self.output_blocks[id] = { count = #block, folded = folded }
+  self.output_blocks[id] = { count = #block + #spacer, folded = folded }
 
   self.chat.ui:move_cursor(was_following)
 end
