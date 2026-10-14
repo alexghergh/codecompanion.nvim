@@ -234,8 +234,8 @@ function ACPHandler:create_and_send_prompt(payload)
 
   return self.chat.acp_connection
     :session_prompt(transformed_payload.messages)
-    :on_message_chunk(function(content)
-      self:handle_message_chunk(content)
+    :on_message_chunk(function(content, opts)
+      self:handle_message_chunk(content, opts)
     end)
     :on_thought_chunk(function(content)
       self:handle_thought_chunk(content)
@@ -267,8 +267,20 @@ end
 
 ---Handle incoming message chunks
 ---@param content string
+---@param opts? { message_id?: string }
 ---@return nil
-function ACPHandler:handle_message_chunk(content)
+function ACPHandler:handle_message_chunk(content, opts)
+  opts = opts or {}
+
+  -- Agents can send several messages in one turn (Codex does, around its server-side tools);
+  -- without a break the end of one runs straight into the start of the next
+  if opts.message_id then
+    if self._message_id and self._message_id ~= opts.message_id then
+      content = "\n\n" .. content
+    end
+    self._message_id = opts.message_id
+  end
+
   table.insert(self.output, content)
   self.chat:add_buf_message(
     { role = config.constants.LLM_ROLE, content = content },
