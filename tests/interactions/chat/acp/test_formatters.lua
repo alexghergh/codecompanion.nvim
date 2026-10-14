@@ -250,17 +250,28 @@ T["ACP Formatters"]["nil tool_call is normalised to 'Other: Invalid tool call'"]
   h.eq("Other: Invalid tool call", child.lua_get("formatters.tool_message(nil, { opts = {} })"))
 end
 
-T["ACP Formatters"]["error_lines - streamed command output"] = function()
+T["ACP Formatters"]["output_lines - streamed command output"] = function()
   h.eq(
     { "command failed", "details" },
     child.lua_get([[
-      formatters.error_lines({
+      formatters.output_lines({
         status = "failed",
         rawOutput = { exit_code = 1 },
         streamed_output = "command failed\ndetails\n",
       })
     ]])
   )
+end
+
+T["ACP Formatters"]["output_lines - caps long output with a marker"] = function()
+  local lines = child.lua_get([[
+    formatters.output_lines({
+      status = "completed",
+      streamed_output = string.rep("line\n", 250),
+    })
+  ]])
+  h.eq(201, #lines)
+  h.eq("[+50 more lines]", lines[201])
 end
 
 return T

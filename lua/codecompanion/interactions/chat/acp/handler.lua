@@ -16,6 +16,7 @@ local watch = require("codecompanion.interactions.shared.watch")
 ---@field tools table<string, table> Cache of tool calls by their ID
 ---@field edits table<string, { path: string, line?: number }[]> Files each tool call has edited, by tool call ID
 ---@field ui_state table<string, table> Cache of tool call UI states (line_number, icon_id) by tool call ID
+---@field output_blocks table<string, { count: number, folded: boolean }> Output blocks written below tool labels, by tool call ID
 ---@field _permission { queue: CodeCompanion.Queue, active: boolean, respond: function|nil } Internal state for managing permission requests
 local ACPHandler = {}
 
@@ -29,6 +30,7 @@ function ACPHandler.new(chat)
     tools = {},
     edits = {},
     ui_state = {},
+    output_blocks = {},
     _permission = {
       active = false,
       queue = Queue.new(),
@@ -39,7 +41,17 @@ function ACPHandler.new(chat)
   return self --[[@type CodeCompanion.Chat.ACPHandler]]
 end
 
-local ERROR_NS = vim.api.nvim_create_namespace("CodeCompanion-acp_tool_errors")
+local OUTPUT_NS = vim.api.nvim_create_namespace("CodeCompanion-acp_tool_output")
+local OUTPUT_PREVIEW_LINES = 2
+
+---Does this update write the tool call's output below its label? Commands show
+---their output as it arrives; any other tool only once, when it fails
+---@param tool_call table
+---@param was_failed boolean
+---@return boolean
+local function shows_output(tool_call, was_failed)
+  return tool_call.kind == "execute" or (tool_call.status == "failed" and not was_failed)
+end
 
 ---Merge an incoming tool call/update into the cache
 ---@param existing table|nil
@@ -320,29 +332,56 @@ function ACPHandler:flush_edits(id, tool_call)
   end
 end
 
----Render a failed tool call's output in red below its label. Written
----directly to the buffer (not through the builder) so the block stays out
----of the streamed message flow and its block/type tracking.
+---Render a tool call's output below its label: a short preview, then the rest
+---in a fold that reads "+N lines" when closed. Written directly to the buffer (not
+---through the builder) so the block stays out of the streamed message flow and
+---its block/type tracking; each update replaces the previous block
+---@param id string
 ---@param tool_call table
 ---@param label_line number 1-based line holding the tool label
 ---@return nil
-function ACPHandler:_render_failed_output(tool_call, label_line)
-  local err = formatter.error_lines(tool_call)
-  if #err == 0 then
+function ACPHandler:_render_output(id, tool_call, label_line)
+  local output = formatter.output_lines(tool_call)
+  if #output == 0 then
     return
   end
 
+  -- Indented so the agent's output can never read as markdown headings or fences
+  local block = {}
+  for i, line in ipairs(output) do
+    table.insert(block, (i == 1 and "  \u{2514} " or "    ") .. line)
+  end
+
   local bufnr = self.chat.bufnr
+  local folds = self.chat.ui.folds
+  local previous = self.output_blocks[id] or { count = 0, folded = false }
+  local fold_row = label_line + OUTPUT_PREVIEW_LINES
+  local was_open = previous.folded and folds:is_open(bufnr, fold_row)
+  local was_following = self.chat.ui:is_following()
+  local hl_group = tool_call.status == "failed" and "CodeCompanionChatToolError" or "CodeCompanionChatToolOutput"
+
   self.chat.ui:unlock_buf()
-  vim.api.nvim_buf_set_lines(bufnr, label_line, label_line, false, err)
+  vim.api.nvim_buf_clear_namespace(bufnr, OUTPUT_NS, label_line, label_line + previous.count)
+  -- Delete before inserting: replacing lines in place keeps the old fold, so each update would nest another
+  vim.api.nvim_buf_set_lines(bufnr, label_line, label_line + previous.count, false, {})
+  vim.api.nvim_buf_set_lines(bufnr, label_line, label_line, false, block)
   -- priority above treesitter (100) and below the status icons (120)
-  vim.api.nvim_buf_set_extmark(bufnr, ERROR_NS, label_line, 0, {
-    end_row = label_line + #err - 1,
-    end_col = #err[#err],
-    hl_group = "CodeCompanionChatToolError",
+  vim.api.nvim_buf_set_extmark(bufnr, OUTPUT_NS, label_line, 0, {
+    end_row = label_line + #block - 1,
+    end_col = #block[#block],
+    hl_group = hl_group,
     priority = 110,
   })
   self.chat.ui:lock_buf()
+
+  -- A one-line fold never displays closed ('foldminlines'), so it would read as opened by the user
+  local folded = #block > OUTPUT_PREVIEW_LINES + 1
+  if folded then
+    folds:create_output_fold(bufnr, fold_row, label_line + #block - 1, { hl_group = hl_group, open = was_open })
+  end
+  self.output_blocks[id] = { count = #block, folded = folded }
+
+  self.chat.ui:move_cursor(was_following)
 end
 
 ---Output tool call to the chat
@@ -359,8 +398,9 @@ function ACPHandler:process_tool_call(tool_call)
 
   -- codex-acp 2.x sends command output only as `_meta.terminal_output_delta`
   -- chunks, one per update; the merge replaces `_meta`, so append each chunk
+  -- it also sends newline-only chunks the command never printed, alongside its usage updates
   local delta = vim.tbl_get(tool_call, "_meta", "terminal_output_delta", "data")
-  if type(delta) == "string" then
+  if type(delta) == "string" and not delta:match("^\n+$") then
     merged.streamed_output = (merged.streamed_output or "") .. delta
   end
   tool_call = merged
@@ -410,8 +450,8 @@ function ACPHandler:process_tool_call(tool_call)
       elseif new_icon_id then
         cached.icon_id = new_icon_id
       end
-      if tool_call.status == "failed" and not was_failed then
-        self:_render_failed_output(tool_call, line_number)
+      if shows_output(tool_call, was_failed) then
+        self:_render_output(id, tool_call, line_number)
       end
       return
     end
@@ -435,8 +475,8 @@ function ACPHandler:process_tool_call(tool_call)
 
   self.ui_state[id] = { line_number = line_number, icon_id = icon_id }
 
-  if tool_call.status == "failed" and not was_failed and line_number then
-    self:_render_failed_output(tool_call, line_number)
+  if line_number and shows_output(tool_call, was_failed) then
+    self:_render_output(id, tool_call, line_number)
   end
 end
 

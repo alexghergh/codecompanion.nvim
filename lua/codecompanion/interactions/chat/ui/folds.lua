@@ -10,6 +10,7 @@ local CONSTANTS = {
   NS_FOLD_TOOLS = api.nvim_create_namespace("CodeCompanion-tool_fold_marks"),
   NS_FOLD_CONTEXT = api.nvim_create_namespace("CodeCompanion-context_fold_marks"),
   NS_FOLD_REASONING = api.nvim_create_namespace("CodeCompanion-reasoning_fold_marks"),
+  NS_FOLD_OUTPUT = api.nvim_create_namespace("CodeCompanion-output_fold_marks"),
 }
 
 -- Unified fold summaries storage
@@ -48,8 +49,18 @@ function Folds.fold_text()
     return vim.fn.foldtext()
   end
 
+  local row = vim.v.foldstart - 1
+  for _, mark in
+    ipairs(api.nvim_buf_get_extmarks(bufnr, CONSTANTS.NS_FOLD_OUTPUT, { row, 0 }, { row, -1 }, { details = true }))
+  do
+    if not mark[4].invalid then
+      local hidden = vim.v.foldend - vim.v.foldstart + 1
+      return { { ("    +%d %s"):format(hidden, hidden == 1 and "line" or "lines"), mark[4].hl_group } }
+    end
+  end
+
   local folds = Folds.fold_summaries[bufnr]
-  local fold_data = folds and folds[vim.v.foldstart - 1]
+  local fold_data = folds and folds[row]
   if not fold_data then
     return vim.fn.foldtext()
   end
@@ -228,6 +239,42 @@ function Folds:create_tool_fold(bufnr, start_row, end_row, foldtext)
   })
 end
 
+---Is there an open fold at the row?
+---@param bufnr number
+---@param row number (0-based)
+---@return boolean
+function Folds:is_open(bufnr, row)
+  local open = false
+  api.nvim_buf_call(bufnr, function()
+    open = vim.fn.foldlevel(row + 1) > 0 and vim.fn.foldclosed(row + 1) == -1
+  end)
+  return open
+end
+
+---Fold the part of a tool's output past its preview; closed, it reads "+N lines"
+---@param bufnr number
+---@param start_row number (0-based)
+---@param end_row number (0-based)
+---@param opts { hl_group: string, open?: boolean }
+function Folds:create_output_fold(bufnr, start_row, end_row, opts)
+  -- The mark goes invalid once its line is replaced, so a rewritten block never keeps a stale fold text
+  api.nvim_buf_set_extmark(bufnr, CONSTANTS.NS_FOLD_OUTPUT, start_row, 0, {
+    end_col = #api.nvim_buf_get_lines(bufnr, start_row, start_row + 1, false)[1],
+    hl_group = opts.hl_group,
+    invalidate = true,
+  })
+
+  local ok, err = pcall(api.nvim_buf_call, bufnr, function()
+    vim.cmd(string.format("%d,%dfold", start_row + 1, end_row + 1))
+    if opts.open then
+      vim.cmd(string.format("%dfoldopen", start_row + 1))
+    end
+  end)
+  if not ok then
+    log:trace("[Folds] Failed to create output fold: %s", err)
+  end
+end
+
 ---Create a context fold (backward compatibility method)
 ---@param bufnr number
 ---@param start_row number (0-based)
@@ -323,6 +370,7 @@ function Folds:cleanup(bufnr)
   api.nvim_buf_clear_namespace(bufnr, CONSTANTS.NS_FOLD_TOOLS, 0, -1)
   api.nvim_buf_clear_namespace(bufnr, CONSTANTS.NS_FOLD_CONTEXT, 0, -1)
   api.nvim_buf_clear_namespace(bufnr, CONSTANTS.NS_FOLD_REASONING, 0, -1)
+  api.nvim_buf_clear_namespace(bufnr, CONSTANTS.NS_FOLD_OUTPUT, 0, -1)
 end
 
 return Folds
