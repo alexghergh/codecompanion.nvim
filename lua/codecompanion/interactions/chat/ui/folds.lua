@@ -37,6 +37,7 @@ function Folds:setup(winnr)
       'v:lua.require("codecompanion.interactions.chat.ui.folds").fold_text()',
       { win = winnr }
     )
+    self:restore_output_folds(winnr)
   end
 end
 
@@ -244,11 +245,29 @@ end
 ---@param row number (0-based)
 ---@return boolean
 function Folds:is_open(bufnr, row)
-  local open = false
-  api.nvim_buf_call(bufnr, function()
-    open = vim.fn.foldlevel(row + 1) > 0 and vim.fn.foldclosed(row + 1) == -1
+  local winnr = vim.fn.win_findbuf(bufnr)[1]
+  if not winnr then
+    return false
+  end
+  return api.nvim_win_call(winnr, function()
+    return vim.fn.foldlevel(row + 1) > 0 and vim.fn.foldclosed(row + 1) == -1
   end)
-  return open
+end
+
+---@param winnr number
+---@param start_row number (0-based)
+---@param end_row number (0-based)
+---@param open? boolean
+local function fold_output_in_window(winnr, start_row, end_row, open)
+  local ok, err = pcall(api.nvim_win_call, winnr, function()
+    vim.cmd(string.format("%d,%dfold", start_row + 1, end_row + 1))
+    if open then
+      vim.cmd(string.format("%dfoldopen", start_row + 1))
+    end
+  end)
+  if not ok then
+    log:trace("[Folds] Failed to create output fold: %s", err)
+  end
 end
 
 ---Fold the part of a tool's output past its preview; closed, it reads "+N lines"
@@ -257,21 +276,36 @@ end
 ---@param end_row number (0-based)
 ---@param opts { hl_group: string, open?: boolean }
 function Folds:create_output_fold(bufnr, start_row, end_row, opts)
-  -- The mark goes invalid once its line is replaced, so a rewritten block never keeps a stale fold text
+  -- The mark spans the fold so a window opened later can recreate it, and goes invalid once the block
+  -- is rewritten; priority below the output block's own highlights
   api.nvim_buf_set_extmark(bufnr, CONSTANTS.NS_FOLD_OUTPUT, start_row, 0, {
-    end_col = #api.nvim_buf_get_lines(bufnr, start_row, start_row + 1, false)[1],
+    end_row = end_row,
+    end_col = #api.nvim_buf_get_lines(bufnr, end_row, end_row + 1, false)[1],
     hl_group = opts.hl_group,
     invalidate = true,
+    priority = 105,
   })
 
-  local ok, err = pcall(api.nvim_buf_call, bufnr, function()
-    vim.cmd(string.format("%d,%dfold", start_row + 1, end_row + 1))
-    if opts.open then
-      vim.cmd(string.format("%dfoldopen", start_row + 1))
+  -- Folds belong to windows; `nvim_buf_call` on a hidden buffer folds a temporary window and loses the fold
+  for _, winnr in ipairs(vim.fn.win_findbuf(bufnr)) do
+    fold_output_in_window(winnr, start_row, end_row, opts.open)
+  end
+end
+
+---Recreate the output folds a window is missing, e.g. ones created while the chat was hidden
+---@param winnr number
+function Folds:restore_output_folds(winnr)
+  local bufnr = api.nvim_win_get_buf(winnr)
+  local marks = api.nvim_buf_get_extmarks(bufnr, CONSTANTS.NS_FOLD_OUTPUT, 0, -1, { details = true })
+  for _, mark in ipairs(marks) do
+    local row, details = mark[2], mark[4]
+    local missing = not details.invalid
+      and api.nvim_win_call(winnr, function()
+        return vim.fn.foldlevel(row + 1) == 0
+      end)
+    if missing then
+      fold_output_in_window(winnr, row, details.end_row)
     end
-  end)
-  if not ok then
-    log:trace("[Folds] Failed to create output fold: %s", err)
   end
 end
 

@@ -1007,6 +1007,64 @@ T["ACPHandler"]["Tool Output"]["draws the colors of terminal escape codes instea
   h.eq(true, vim.tbl_contains(result.groups, "CodeCompanionAnsi___b"))
 end
 
+T["ACPHandler"]["Tool Output"]["separates the output from a tool label written BEFORE it arrived"] = function()
+  local below = child.lua([[
+    for _, id in ipairs({ "exec-4", "exec-5" }) do
+      handler:process_tool_call({
+        toolCallId = id,
+        sessionUpdate = "tool_call",
+        status = "in_progress",
+        kind = "execute",
+        title = id == "exec-4" and "first" or "second",
+      })
+    end
+    for _ = 1, 2 do
+      handler:process_tool_call({
+        toolCallId = "exec-4",
+        sessionUpdate = "tool_call_update",
+        _meta = { terminal_output_delta = { data = "one\n", terminal_id = "exec-4" } },
+      })
+    end
+    return lines_below_label("first")
+  ]])
+
+  h.eq({ GUTTER .. "one", "    one", "" }, vim.list_slice(below, 1, 3))
+  h.eq(true, below[4]:find("second", 1, true) ~= nil)
+end
+
+T["ACPHandler"]["Tool Output"]["folds output that arrived while the chat was hidden"] = function()
+  local result = child.lua([[
+    handler:process_tool_call({
+      toolCallId = "exec-6",
+      sessionUpdate = "tool_call",
+      status = "in_progress",
+      kind = "execute",
+      title = "hidden",
+    })
+    chat.ui:hide()
+    local hidden = #vim.fn.win_findbuf(chat.bufnr) == 0
+    handler:process_tool_call({
+      toolCallId = "exec-6",
+      sessionUpdate = "tool_call_update",
+      _meta = { terminal_output_delta = { data = "a\nb\nc\nd\ne\n", terminal_id = "exec-6" } },
+    })
+    chat.ui:open()
+    local lines = vim.api.nvim_buf_get_lines(chat.bufnr, 0, -1, false)
+    local fold_line
+    for i, line in ipairs(lines) do
+      if line == "    c" then
+        fold_line = i
+      end
+    end
+    local closed = vim.api.nvim_win_call(chat.ui.winnr, function()
+      return vim.fn.foldclosed(fold_line)
+    end)
+    return { hidden = hidden, closed = closed == fold_line }
+  ]])
+
+  h.eq({ hidden = true, closed = true }, result)
+end
+
 T["ACPHandler"]["Tool Output"]["DOES NOT fold a single hidden line"] = function()
   local folded = child.lua([[
     handler:process_tool_call({
