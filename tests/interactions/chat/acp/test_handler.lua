@@ -868,6 +868,154 @@ T["ACPHandler"]["collects streamed terminal output across updates"] = function()
   h.eq("first\nsecond\n", result)
 end
 
+local GUTTER = "  \u{2514} "
+
+T["ACPHandler"]["Tool Output"] = new_set({
+  hooks = {
+    pre_case = function()
+      child.lua([[
+        _G.chat = h.setup_chat_buffer({}, {
+          name = "test_acp",
+          config = {
+            name = "test_acp",
+            type = "acp",
+            handlers = { form_messages = function(a, m) return m end }
+          }
+        })
+        _G.handler = require("codecompanion.interactions.chat.acp.handler").new(_G.chat)
+
+        ---The buffer lines below the line holding the tool label
+        _G.lines_below_label = function(label)
+          local lines = vim.api.nvim_buf_get_lines(_G.chat.bufnr, 0, -1, false)
+          for i, line in ipairs(lines) do
+            if line:find(label, 1, true) then
+              return vim.list_slice(lines, i + 1)
+            end
+          end
+        end
+      ]])
+    end,
+  },
+})
+
+T["ACPHandler"]["Tool Output"]["previews two lines of command output and keeps the rest below them"] = function()
+  local below = child.lua([[
+    handler:process_tool_call({
+      toolCallId = "bash-1",
+      sessionUpdate = "tool_call",
+      status = "in_progress",
+      kind = "execute",
+      title = "ls",
+    })
+    handler:process_tool_call({
+      toolCallId = "bash-1",
+      sessionUpdate = "tool_call_update",
+      status = "completed",
+      content = { { type = "content", content = { type = "text", text = "```\none\ntwo\nthree\nfour\n```" } } },
+    })
+    return vim.list_slice(lines_below_label("ls"), 1, 5)
+  ]])
+
+  h.eq({ GUTTER .. "one", "    two", "    three", "    four" }, vim.list_slice(below, 1, 4))
+end
+
+T["ACPHandler"]["Tool Output"]["streams command output into the block as it arrives"] = function()
+  local result = child.lua([[
+    local snapshots = {}
+    handler:process_tool_call({
+      toolCallId = "exec-1",
+      sessionUpdate = "tool_call",
+      status = "in_progress",
+      kind = "execute",
+      title = "make",
+    })
+    handler:process_tool_call({
+      toolCallId = "exec-1",
+      sessionUpdate = "tool_call_update",
+      _meta = { terminal_output_delta = { data = "a\n", terminal_id = "exec-1" } },
+    })
+    table.insert(snapshots, vim.list_slice(lines_below_label("make"), 1, 1))
+    -- codex-acp sends newline-only chunks that the command never printed
+    handler:process_tool_call({
+      toolCallId = "exec-1",
+      sessionUpdate = "tool_call_update",
+      _meta = { terminal_output_delta = { data = "\n\n", terminal_id = "exec-1" } },
+    })
+    handler:process_tool_call({
+      toolCallId = "exec-1",
+      sessionUpdate = "tool_call_update",
+      _meta = { terminal_output_delta = { data = "b\nc\n", terminal_id = "exec-1" } },
+    })
+    table.insert(snapshots, vim.list_slice(lines_below_label("make"), 1, 4))
+    return snapshots
+  ]])
+
+  h.eq({ GUTTER .. "a" }, result[1])
+  h.eq({ GUTTER .. "a", "    b", "    c" }, vim.list_slice(result[2], 1, 3))
+end
+
+T["ACPHandler"]["Tool Output"]["DOES NOT fold a single hidden line"] = function()
+  local folded = child.lua([[
+    handler:process_tool_call({
+      toolCallId = "exec-2",
+      sessionUpdate = "tool_call",
+      status = "in_progress",
+      kind = "execute",
+      title = "three",
+    })
+    handler:process_tool_call({
+      toolCallId = "exec-2",
+      sessionUpdate = "tool_call_update",
+      _meta = { terminal_output_delta = { data = "a\nb\nc\n", terminal_id = "exec-2" } },
+    })
+    return handler.output_blocks["exec-2"].folded
+  ]])
+
+  h.eq(false, folded)
+end
+
+T["ACPHandler"]["Tool Output"]["DOES NOT render output for a tool that is NOT a command"] = function()
+  local below = child.lua([[
+    handler:process_tool_call({
+      toolCallId = "read-1",
+      sessionUpdate = "tool_call",
+      status = "in_progress",
+      kind = "read",
+      title = "Read notes.md",
+    })
+    handler:process_tool_call({
+      toolCallId = "read-1",
+      sessionUpdate = "tool_call_update",
+      status = "completed",
+      content = { { type = "content", content = { type = "text", text = "file contents" } } },
+    })
+    return lines_below_label("notes.md")
+  ]])
+
+  h.eq(false, vim.tbl_contains(below, GUTTER .. "file contents"))
+end
+
+T["ACPHandler"]["Tool Output"]["renders the output of a FAILED tool of any kind"] = function()
+  local below = child.lua([[
+    handler:process_tool_call({
+      toolCallId = "read-2",
+      sessionUpdate = "tool_call",
+      status = "in_progress",
+      kind = "read",
+      title = "Read missing.md",
+    })
+    handler:process_tool_call({
+      toolCallId = "read-2",
+      sessionUpdate = "tool_call_update",
+      status = "failed",
+      content = { { type = "content", content = { type = "text", text = "no such file" } } },
+    })
+    return vim.list_slice(lines_below_label("missing.md"), 1, 1)
+  ]])
+
+  h.eq({ GUTTER .. "no such file" }, below)
+end
+
 T["ACPHandler"]["Permission Queue"] = new_set()
 
 T["ACPHandler"]["Permission Queue"]["queues concurrent requests and presents one at a time"] = function()

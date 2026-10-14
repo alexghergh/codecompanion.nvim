@@ -12,8 +12,8 @@
         - When `verbose_output` is set on the adapter, completed calls may
           append " — <summary>" or replace the label entirely (edits)
 
-      Failed calls additionally expose `error_lines` so the handler can
-      render the tool's output below the label.
+      `output_lines` extracts a call's output so the handler can render it
+      below the label.
 -------------------------------------------------------------------------------
     Attribution:
       If you use or distribute this code, please credit:
@@ -25,7 +25,7 @@ local M = {}
 
 local MAX_TITLE = 150
 local MAX_TEXT = 100
-local MAX_ERROR_LINES = 10
+local MAX_OUTPUT_LINES = 200
 
 ---Normalize a path relative to cwd
 ---@param p string
@@ -224,11 +224,11 @@ local function content_summary(tool_call)
   end
 end
 
----Extract a failed tool call's output as display lines, capped at
----MAX_ERROR_LINES with a "[+N more lines]" marker
+---Extract a tool call's output as display lines, capped at MAX_OUTPUT_LINES
+---with a "[+N more lines]" marker
 ---@param tool_call table
 ---@return string[]
-function M.error_lines(tool_call)
+function M.output_lines(tool_call)
   local parts = {}
   if type(tool_call.content) == "table" then
     for _, c in ipairs(tool_call.content) do
@@ -283,9 +283,9 @@ function M.error_lines(tool_call)
     return {}
   end
 
-  if #lines > MAX_ERROR_LINES then
-    local dropped = #lines - MAX_ERROR_LINES
-    lines = vim.list_slice(lines, 1, MAX_ERROR_LINES)
+  if #lines > MAX_OUTPUT_LINES then
+    local dropped = #lines - MAX_OUTPUT_LINES
+    lines = vim.list_slice(lines, 1, MAX_OUTPUT_LINES)
     table.insert(lines, ("[+%d more lines]"):format(dropped))
   end
   return lines

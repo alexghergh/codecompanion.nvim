@@ -25,6 +25,7 @@ api.nvim_set_hl(0, "CodeCompanionChatToolInProgressIcon", { link = "DiagnosticIn
 api.nvim_set_hl(0, "CodeCompanionChatToolPending", { link = "DiagnosticWarn", default = true })
 api.nvim_set_hl(0, "CodeCompanionChatToolPendingIcon", { link = "DiagnosticWarn", default = true })
 api.nvim_set_hl(0, "CodeCompanionChatToolError", { link = "DiagnosticError", default = true })
+api.nvim_set_hl(0, "CodeCompanionChatToolOutput", { link = "Comment", default = true })
 api.nvim_set_hl(0, "CodeCompanionChatToolSuccess", { link = "DiagnosticOK", default = true })
 api.nvim_set_hl(0, "CodeCompanionChatToolSuccessIcon", { link = "DiagnosticOK", default = true })
 api.nvim_set_hl(0, "CodeCompanionChatToolText", { link = "Comment", default = true })
