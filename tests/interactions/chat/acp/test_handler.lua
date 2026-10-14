@@ -980,6 +980,33 @@ T["ACPHandler"]["Tool Output"]["streams command output into the block as it arri
   h.eq({ GUTTER .. "a", "    b", "    c" }, vim.list_slice(result[2], 1, 3))
 end
 
+T["ACPHandler"]["Tool Output"]["draws the colors of terminal escape codes instead of the codes"] = function()
+  local result = child.lua([[
+    handler:process_tool_call({
+      toolCallId = "exec-3",
+      sessionUpdate = "tool_call",
+      status = "in_progress",
+      kind = "execute",
+      title = "test",
+    })
+    handler:process_tool_call({
+      toolCallId = "exec-3",
+      sessionUpdate = "tool_call_update",
+      _meta = { terminal_output_delta = { data = "\27[1mTotal:\27[0m 4\n", terminal_id = "exec-3" } },
+    })
+    local below = lines_below_label("test")
+    local ns = vim.api.nvim_get_namespaces()["CodeCompanion-acp_tool_output"]
+    local groups = {}
+    for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(chat.bufnr, ns, 0, -1, { details = true })) do
+      table.insert(groups, mark[4].hl_group)
+    end
+    return { line = below[1], groups = groups }
+  ]])
+
+  h.eq(GUTTER .. "Total: 4", result.line)
+  h.eq(true, vim.tbl_contains(result.groups, "CodeCompanionAnsi___b"))
+end
+
 T["ACPHandler"]["Tool Output"]["DOES NOT fold a single hidden line"] = function()
   local folded = child.lua([[
     handler:process_tool_call({

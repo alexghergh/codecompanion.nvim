@@ -2,6 +2,7 @@ local Approvals = require("codecompanion.interactions.chat.tools.approvals")
 local Queue = require("codecompanion.interactions.chat.tools.runtime.queue")
 local Runner = require("codecompanion.interactions.chat.tools.runtime.runner")
 
+local ansi = require("codecompanion.utils.ansi")
 local config = require("codecompanion.config")
 local log = require("codecompanion.utils.log")
 local os_utils = require("codecompanion.utils.os")
@@ -10,12 +11,12 @@ local utils = require("codecompanion.utils")
 
 local fmt = string.format
 
----Strip any ANSI color codes which don't render in the chat buffer
+---Strip any ANSI escape codes which don't render in the chat buffer
 ---@param tbl table
 ---@return table
 local function strip_ansi(tbl)
   for i, v in ipairs(tbl) do
-    tbl[i] = v:gsub("\027%[[0-9;]*%a", "")
+    tbl[i] = ansi.strip(v)
   end
   return tbl
 end

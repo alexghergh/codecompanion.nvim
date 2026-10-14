@@ -1,6 +1,7 @@
 local Icons = require("codecompanion.interactions.chat.ui.icons")
 local Queue = require("codecompanion.utils.queue")
 
+local ansi = require("codecompanion.utils.ansi")
 local async = require("codecompanion.utils.async")
 local config = require("codecompanion.config")
 local formatter = require("codecompanion.interactions.chat.acp.formatters")
@@ -43,6 +44,29 @@ end
 
 local OUTPUT_NS = vim.api.nvim_create_namespace("CodeCompanion-acp_tool_output")
 local OUTPUT_PREVIEW_LINES = 2
+
+---Indent a tool's output for the chat buffer and turn its terminal escape codes into highlights;
+---indented so the output can never read as markdown headings or fences
+---@param output string[]
+---@return string[] block
+---@return { row: number, col: number, end_col: number, hl_group: string }[] colors 0-based, relative to the block
+local function build_output_block(output)
+  local block, colors = {}, {}
+  for i, line in ipairs(output) do
+    local prefix = i == 1 and "  \u{2514} " or "    "
+    local text, spans = ansi.parse(line)
+    table.insert(block, prefix .. text)
+    for _, span in ipairs(spans) do
+      table.insert(colors, {
+        row = i - 1,
+        col = #prefix + span.col,
+        end_col = #prefix + span.end_col,
+        hl_group = span.hl_group,
+      })
+    end
+  end
+  return block, colors
+end
 
 ---Does this update write the tool call's output below its label? Commands show
 ---their output as it arrives; any other tool only once, when it fails
@@ -358,11 +382,7 @@ function ACPHandler:_render_output(id, tool_call, label_line)
     return
   end
 
-  -- Indented so the agent's output can never read as markdown headings or fences
-  local block = {}
-  for i, line in ipairs(output) do
-    table.insert(block, (i == 1 and "  \u{2514} " or "    ") .. line)
-  end
+  local block, colors = build_output_block(output)
 
   local bufnr = self.chat.bufnr
   local folds = self.chat.ui.folds
@@ -384,6 +404,14 @@ function ACPHandler:_render_output(id, tool_call, label_line)
     hl_group = hl_group,
     priority = 110,
   })
+  -- Terminal colors draw over the dimmed block, still below the status icons
+  for _, color in ipairs(colors) do
+    vim.api.nvim_buf_set_extmark(bufnr, OUTPUT_NS, label_line + color.row, color.col, {
+      end_col = color.end_col,
+      hl_group = color.hl_group,
+      priority = 115,
+    })
+  end
   self.chat.ui:lock_buf()
 
   -- A one-line fold never displays closed ('foldminlines'), so it would read as opened by the user
