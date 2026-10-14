@@ -143,6 +143,25 @@ end
 
 T["Builder"] = new_set()
 
+T["Builder"]["a new block DOES NOT change the line it is appended below"] = function()
+  local result = child.lua([[
+    _G.chat:add_buf_message({ role = "llm", content = "first" }, { type = _G.MT.LLM_MESSAGE })
+    local line_count = vim.api.nvim_buf_line_count(_G.chat.bufnr)
+    local first_changed
+    vim.api.nvim_buf_attach(_G.chat.bufnr, false, {
+      on_lines = function(_, _, _, firstline)
+        first_changed = first_changed or firstline
+        return true
+      end,
+    })
+    _G.chat:add_buf_message({ role = "llm", content = "reasoning" }, { type = _G.MT.REASONING_MESSAGE })
+    return { first_changed = first_changed, line_count = line_count }
+  ]])
+
+  -- Folds and extmarks ending on the old last line survive only if that line is left as is
+  h.eq(result.line_count, result.first_changed)
+end
+
 T["Builder"]["a status write is collapsed onto a single line"] = function()
   child.lua([[
     _G.chat:add_buf_message(
