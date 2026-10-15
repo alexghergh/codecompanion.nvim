@@ -23,6 +23,84 @@ local CONSTANTS = {
   AUTOCMD_GROUP = "codecompanion.chat.ui",
 }
 
+-- The size the user last left a split chat at, reused by the next split that opens
+local saved_split_size = {}
+
+---Run `fn` with every window in the tab except `free_winnr` pinned to its size
+---@param fn fun(): any
+---@param free_winnr? number
+---@return any
+local function with_pinned_windows(fn, free_winnr)
+  -- winfixwidth/winfixheight rather than 'equalalways': setting that back to true re-equalizes every window
+  local saved = {}
+  for _, winnr in ipairs(api.nvim_tabpage_list_wins(0)) do
+    if winnr ~= free_winnr then
+      saved[winnr] = { width = vim.wo[winnr].winfixwidth, height = vim.wo[winnr].winfixheight }
+      vim.wo[winnr].winfixwidth = true
+      vim.wo[winnr].winfixheight = true
+    end
+  end
+
+  local ok, result = pcall(fn)
+  for winnr, fixed in pairs(saved) do
+    if api.nvim_win_is_valid(winnr) then
+      vim.wo[winnr].winfixwidth = fixed.width
+      vim.wo[winnr].winfixheight = fixed.height
+    end
+  end
+  if not ok then
+    error(result)
+  end
+  return result
+end
+
+---The window closest to `target` along an axis, which takes over its space when it closes
+---@param target number
+---@param axis "row"|"col"
+---@return number|nil
+local function find_nearest_win(target, axis)
+  local index = axis == "row" and 1 or 2
+  local position = api.nvim_win_get_position(target)[index]
+  local nearest, nearest_distance = nil, math.huge
+  for _, winnr in ipairs(api.nvim_tabpage_list_wins(0)) do
+    local distance = math.abs(api.nvim_win_get_position(winnr)[index] - position)
+    if winnr ~= target and distance < nearest_distance then
+      nearest, nearest_distance = winnr, distance
+    end
+  end
+  return nearest
+end
+
+---The window that gives up space to a new split chat
+---@param window table
+---@return number
+local function find_absorbing_win(window)
+  -- A full height split spans every column, so the widest window can best spare the space
+  if window.layout == "vertical" and window.full_height then
+    local widest, widest_width = api.nvim_get_current_win(), -1
+    for _, winnr in ipairs(api.nvim_tabpage_list_wins(0)) do
+      local width = api.nvim_win_get_width(winnr)
+      if width > widest_width then
+        widest, widest_width = winnr, width
+      end
+    end
+    return widest
+  end
+  return api.nvim_get_current_win()
+end
+
+---Size a split chat as the user last left it, unless this open asks for a size
+---@param window table
+---@param requested? table
+local function apply_saved_split_size(window, requested)
+  requested = requested or {}
+  if window.layout == "vertical" and saved_split_size.width and not requested.width then
+    window.width = math.min(saved_split_size.width, vim.o.columns - 1)
+  elseif window.layout == "horizontal" and saved_split_size.height and not requested.height then
+    window.height = math.min(saved_split_size.height, vim.o.lines - 1)
+  end
+end
+
 ---Set the LLM role based on the adapter
 ---@param role string|function
 ---@param adapter table
@@ -35,6 +113,7 @@ local function set_llm_role(role, adapter)
 end
 
 ---@class CodeCompanion.Chat.UI
+---@field absorbing_winnr? number The window that gave up space when the chat split opened
 ---@field adapter CodeCompanion.HTTPAdapter|CodeCompanion.ACPAdapter The adapter in use for the chat
 ---@field aug number The autocmd group ID
 ---@field chat_bufnr number The buffer number of the chat
@@ -226,10 +305,20 @@ function UI:open(opts)
     title = string.format(" %s ", self.title)
   end
 
-  self.winnr = shared_ui.open(self.chat_bufnr, window, {
-    title = title,
-    filetype = "codecompanion",
-  })
+  local function open_window()
+    return shared_ui.open(self.chat_bufnr, window, {
+      title = title,
+      filetype = "codecompanion",
+    })
+  end
+
+  if window.layout == "vertical" or window.layout == "horizontal" then
+    apply_saved_split_size(window, self.window_opts)
+    self.absorbing_winnr = find_absorbing_win(window)
+    self.winnr = with_pinned_windows(open_window, self.absorbing_winnr)
+  else
+    self.winnr = open_window()
+  end
 
   log:trace("Chat opened with ID %d", self.chat_id)
   return self:_setup_after_open(opts)
@@ -277,7 +366,25 @@ function UI:hide(opts)
     else
       layout = config.display.chat.window.layout
     end
-    shared_ui.hide(self.winnr, self.chat_bufnr, layout)
+
+    local winnr = vim.fn.bufwinid(self.chat_bufnr)
+    if (layout == "vertical" or layout == "horizontal") and winnr ~= -1 then
+      if layout == "vertical" then
+        saved_split_size.width = api.nvim_win_get_width(winnr)
+      else
+        saved_split_size.height = api.nvim_win_get_height(winnr)
+      end
+      -- The space goes back to the window that gave it up, so the layout returns to how it was
+      local free_winnr = self.absorbing_winnr
+      if not (free_winnr and vim.tbl_contains(api.nvim_tabpage_list_wins(0), free_winnr)) then
+        free_winnr = find_nearest_win(winnr, layout == "vertical" and "col" or "row")
+      end
+      with_pinned_windows(function()
+        shared_ui.hide(winnr, self.chat_bufnr, layout)
+      end, free_winnr)
+    else
+      shared_ui.hide(self.winnr, self.chat_bufnr, layout)
+    end
   end
 
   utils.fire("ChatHidden", { bufnr = self.chat_bufnr, id = self.chat_id })
