@@ -433,18 +433,21 @@ Chat.MESSAGE_TYPES = {
   USER_MESSAGE = "user_message",
 }
 
+---The user's Markdown injection query without `injection.combined`
+---@return string
+local function get_markdown_injections()
+  local query = {}
+  for _, file in ipairs(vim.treesitter.query.get_files("markdown", "injections")) do
+    table.insert(query, table.concat(vim.fn.readfile(file), "\n"))
+  end
+  return (table.concat(query, "\n"):gsub("%s*%(#set! injection%.combined%)", ""))
+end
+
 ---Initiate the Tree-sitter parsers used in the chat
 ---@param chat CodeCompanion.Chat
 ---@return boolean
 local function init_parsers(chat)
   chat.parsers = {}
-
-  local ok, markdown = pcall(vim.treesitter.get_parser, chat.bufnr, "markdown")
-  if not ok or not markdown then
-    log:error("[chat::init::new] Could not find the Markdown Tree-sitter parser")
-    return false
-  end
-  chat.parsers.markdown = markdown
 
   -- markdown_inline drives image detection; cache once to avoid re-resolving per submit
   local inline_ok, markdown_inline = pcall(vim.treesitter.get_parser, chat.bufnr, "markdown_inline")
@@ -460,6 +463,18 @@ local function init_parsers(chat)
     end
     chat.parsers.yaml = yaml
   end
+
+  -- Neovim caches one parser per buffer and a request for another language replaces it, so the Markdown
+  -- parser comes last for `vim.treesitter.start` to highlight with it rather than create a second one.
+  -- A combined injection (Markdown's HTML blocks) makes every parse rescan the whole buffer for injections
+  local ok, markdown = pcall(vim.treesitter.get_parser, chat.bufnr, "markdown", {
+    injections = { markdown = get_markdown_injections() },
+  })
+  if not ok or not markdown then
+    log:error("[chat::init::new] Could not find the Markdown Tree-sitter parser")
+    return false
+  end
+  chat.parsers.markdown = markdown
 
   return true
 end

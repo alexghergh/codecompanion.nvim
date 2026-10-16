@@ -87,6 +87,24 @@ T["Chat"]["chat buffer is initialized"] = function()
   h.expect_screenshot(child.get_screenshot(), "tests/screenshots/interactions/chat/chat_buffer_initialized")
 end
 
+T["Chat"]["highlights with the same markdown parser it parses messages with"] = function()
+  local same = child.lua([[
+    vim.wait(50, function() return false end)
+    local highlighter = vim.treesitter.highlighter.active[_G.chat.bufnr]
+    return highlighter ~= nil and highlighter.tree == _G.chat.parsers.markdown
+  ]])
+
+  h.eq(true, same)
+end
+
+T["Chat"]["DOES NOT combine injections, so a parse only scans the rows it asks for"] = function()
+  local combined = child.lua([[
+    return _G.chat.parsers.markdown._injection_query.has_combined_injections == true
+  ]])
+
+  h.eq(false, combined)
+end
+
 T["Chat"]["cursor is placed after last character when prompt library has non-empty user prompt"] = function()
   local child_test = MiniTest.new_child_neovim()
   h.child_start(child_test)
