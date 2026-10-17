@@ -97,6 +97,35 @@ T["no diff -> approval prompt -> return selected option"] = function()
   h.eq(false, result.canceled)
 end
 
+T["no diff -> approval prompt shows the adapter's sandbox notice"] = function()
+  local notice = child.lua([[
+    local ap = require("codecompanion.interactions.chat.helpers.approval_prompt")
+    local shown
+    ap.request = function(_, opts)
+      shown = opts.notice
+    end
+
+    local chat = {
+      bufnr = 0,
+      adapter = {
+        handlers = {
+          sandbox_notice = function(_, tool_call)
+            return { text = "Runs outside the sandbox: " .. tool_call.rawInput.command, level = "warning" }
+          end,
+        },
+      },
+    }
+    require("codecompanion.interactions.chat.acp.request_permission").confirm(chat, {
+      tool_call = { toolCallId = "tc-sandbox", kind = "execute", rawInput = { command = "make" }, content = {} },
+      options = { { optionId = "allow_once_id", name = "Allow", kind = "allow_once" } },
+      respond = function() end,
+    })
+    return shown
+  ]])
+
+  h.eq({ text = "Runs outside the sandbox: make", level = "warning" }, notice)
+end
+
 T["no diff -> approval prompt -> reject option"] = function()
   local result = child.lua([[
     -- Stub approval_prompt to auto-select by label

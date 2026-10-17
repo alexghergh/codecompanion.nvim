@@ -2,6 +2,10 @@ local config = require("codecompanion.config")
 local log = require("codecompanion.utils.log")
 local shared = require("codecompanion.adapters.shared")
 
+---@class CodeCompanion.ACPAdapter.SandboxNotice
+---@field text string
+---@field level "warning"|"info"
+
 ---@class CodeCompanion.ACPAdapter
 ---@field name string The name of the adapter
 ---@field model string The model to use with the adapter
@@ -19,6 +23,7 @@ local shared = require("codecompanion.adapters.shared")
 ---@field handlers.setup? fun(self: CodeCompanion.ACPAdapter): boolean
 ---@field handlers.auth? fun(self: CodeCompanion.ACPAdapter): boolean Manually handle authentication
 ---@field handlers.format_permission_prompt? fun(self: CodeCompanion.ACPAdapter, tool_call: table): string|nil Override the prompt shown for a permission request
+---@field handlers.sandbox_notice? fun(self: CodeCompanion.ACPAdapter, tool_call: table): CodeCompanion.ACPAdapter.SandboxNotice|nil Say where a permission request's command runs
 ---@field handlers.on_exit? fun(self: CodeCompanion.ACPAdapter, data: table): table|nil
 ---@field handlers.teardown? fun(self: CodeCompanion.ACPAdapter): any
 ---@field protocol? table Implement the ACP protocol in the adapter

@@ -9,15 +9,32 @@ local utils = require("codecompanion.utils")
 local fmt = string.format
 
 local ANCHOR_NS = vim.api.nvim_create_namespace("CodeCompanion-approval_anchor")
+local NOTICE_NS = vim.api.nvim_create_namespace("CodeCompanion-approval_notice")
+
+local NOTICE_HL = {
+  info = "CodeCompanionChatApprovalInfo",
+  warning = "CodeCompanionChatApprovalWarning",
+}
 
 local M = {}
+
+---@param notice CodeCompanion.ACPAdapter.SandboxNotice
+---@return string
+local function format_notice(notice)
+  local icon = notice.level == "warning" and config.display.icons.warning or ""
+  return icon .. notice.text
+end
 
 ---Build the markdown content for the approval prompt
 ---@param opts table
 ---@return string
 local function build_message(opts)
   local title = opts.title or "Approval Required"
-  local lines = { "", "", "---", "**" .. title .. "**", "" }
+  local lines = { "", "", "---", "**" .. title .. "**" }
+  if opts.notice then
+    table.insert(lines, format_notice(opts.notice))
+  end
+  table.insert(lines, "")
 
   if opts.prompt then
     table.insert(lines, opts.prompt)
@@ -53,7 +70,7 @@ end
 
 ---Request approval from the user via the chat buffer
 ---@param chat CodeCompanion.Chat
----@param opts { id: string|number, title?: string, prompt?: string, name?: string, choices: CodeCompanion.Chat.ApprovalChoice[] }
+---@param opts { id: string|number, title?: string, prompt?: string, notice?: CodeCompanion.ACPAdapter.SandboxNotice, name?: string, choices: CodeCompanion.Chat.ApprovalChoice[] }
 ---@return fun(choice_label: string) on_done Callback to finalize the prompt from external code (e.g. diff keymaps)
 function M.request(chat, opts)
   local bufnr = chat.bufnr
@@ -62,6 +79,22 @@ function M.request(chat, opts)
 
   local content = build_message(opts)
   local prompt_end = chat:add_buf_message({ role = config.constants.LLM_ROLE, content = content })
+
+  if prompt_end and opts.notice then
+    local notice_line = format_notice(opts.notice)
+    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, prompt_end, false)
+    for row = #lines, 1, -1 do
+      if lines[row] == notice_line then
+        local hl_group = NOTICE_HL[opts.notice.level]
+        vim.api.nvim_buf_set_extmark(bufnr, NOTICE_NS, row - 1, 0, { end_col = #notice_line, hl_group = hl_group })
+        -- A warning colors the title above it too
+        if opts.notice.level == "warning" then
+          vim.api.nvim_buf_set_extmark(bufnr, NOTICE_NS, row - 2, 0, { end_col = #lines[row - 1], hl_group = hl_group })
+        end
+        break
+      end
+    end
+  end
 
   -- Anchor the eventual feedback to the prompt block: the agent keeps
   -- streaming (e.g. tool labels of already-approved calls) while the user

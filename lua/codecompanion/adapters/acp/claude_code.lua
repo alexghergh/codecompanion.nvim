@@ -75,6 +75,17 @@ return {
       end
     end,
 
+    ---Claude's Bash tool asks to leave the sandbox with `dangerouslyDisableSandbox`, passed through in rawInput
+    ---@param self CodeCompanion.ACPAdapter
+    ---@param tool_call table
+    ---@return CodeCompanion.ACPAdapter.SandboxNotice|nil
+    sandbox_notice = function(self, tool_call)
+      local raw = tool_call and tool_call.rawInput
+      if type(raw) == "table" and raw.dangerouslyDisableSandbox == true then
+        return { text = "Runs outside the sandbox", level = "warning" }
+      end
+    end,
+
     ---@param self CodeCompanion.ACPAdapter
     ---@param messages table
     ---@param capabilities table

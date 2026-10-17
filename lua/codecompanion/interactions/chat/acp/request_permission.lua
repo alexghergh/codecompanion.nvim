@@ -257,6 +257,7 @@ local function approve_in_chat(permission, choices, prompt_opts)
     choices = choices,
     id = permission.request.id,
     name = permission.request.tool_call and permission.request.tool_call.kind or nil,
+    notice = permission.notice,
     prompt = prompt_opts.prompt,
     title = prompt_opts.title,
   })
@@ -322,11 +323,16 @@ function M.confirm(chat, request)
 
   local has_diff = tool_call and requires_diff(tool_call)
 
-  local permission = { chat = chat, request = request }
+  local handlers = chat.adapter and chat.adapter.handlers or {}
+  local permission = {
+    chat = chat,
+    request = request,
+    notice = handlers.sandbox_notice and handlers.sandbox_notice(chat.adapter, tool_call),
+  }
   local choices = build_choices(permission, has_diff)
 
   if not has_diff then
-    local format = chat.adapter and chat.adapter.handlers and chat.adapter.handlers.format_permission_prompt
+    local format = handlers.format_permission_prompt
     local prompt = format and format(chat.adapter, tool_call)
     if not prompt then
       local kind = tool_call and tool_call.kind or "Permission"

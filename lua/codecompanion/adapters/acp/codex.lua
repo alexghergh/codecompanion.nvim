@@ -50,6 +50,25 @@ return {
       return helpers.form_messages(self, messages, capabilities)
     end,
 
+    ---Codex (0.160.1) asks for a command it would sandbox only when the model asks to leave the sandbox, or
+    ---when the command is on its dangerous list and still runs sandboxed (`exec_policy.rs`); the request
+    ---carries neither fact, so a plain command can only be marked as possibly unsandboxed
+    ---@param self CodeCompanion.ACPAdapter
+    ---@param tool_call table
+    ---@return CodeCompanion.ACPAdapter.SandboxNotice|nil
+    sandbox_notice = function(self, tool_call)
+      local raw = tool_call and type(tool_call.rawInput) == "table" and tool_call.rawInput or {}
+      if raw.url then
+        return { text = "Sandboxed, with network access to " .. raw.url, level = "info" }
+      end
+      if raw.additionalPermissions then
+        return { text = "Sandboxed, with extra permissions", level = "info" }
+      end
+      if raw.command or (tool_call and tool_call.kind == "execute") then
+        return { text = "May run outside the sandbox", level = "warning" }
+      end
+    end,
+
     ---Function to run when the request has completed. Useful to catch errors
     ---@param self CodeCompanion.ACPAdapter
     ---@param code number
