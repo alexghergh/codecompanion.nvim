@@ -27,6 +27,17 @@ local T = new_set({
             },
           })
         end
+
+        ---The chat buffer from the line holding `text` onwards
+        _G.lines_from = function(text)
+          local lines = vim.api.nvim_buf_get_lines(chat.bufnr, 0, -1, false)
+          for i, line in ipairs(lines) do
+            if line == text then
+              return vim.list_slice(lines, i)
+            end
+          end
+          return lines
+        end
       ]])
     end,
     post_case = function()
@@ -61,6 +72,27 @@ T["Approval prompt"]["shows the sandbox notice under the title, highlighted for 
   h.eq(true, vim.tbl_contains(result.groups, "CodeCompanionChatApprovalWarning"))
   -- a warning colors the title too
   h.eq(true, vim.tbl_contains(result.title_groups, "CodeCompanionChatApprovalWarning"))
+end
+
+T["Approval prompt"]["removes the prompt once the user answers it"] = function()
+  local lines = child.lua([[
+    local on_done = request()
+    on_done("Accept")
+    return lines_from("Execute: ls")
+  ]])
+
+  h.eq({ "Execute: ls" }, lines)
+end
+
+T["Approval prompt"]["DOES NOT remove what the agent wrote below the prompt while it waited"] = function()
+  local lines = child.lua([[
+    local on_done = request()
+    chat:add_buf_message({ role = "llm", content = "Execute: pwd" }, { type = chat.MESSAGE_TYPES.TOOL_MESSAGE })
+    on_done("Reject")
+    return lines_from("Execute: ls")
+  ]])
+
+  h.eq({ "Execute: ls", "", "Execute: pwd" }, lines)
 end
 
 return T
