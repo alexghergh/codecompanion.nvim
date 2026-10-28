@@ -108,6 +108,7 @@ function Connection.new(args)
     _pending_callbacks = {},
     _state = { handle = nil, id_gen = jsonrpc.IdGenerator.new(), line_buffer = jsonrpc.LineBuffer.new() },
     _steering_ids = {},
+    _subagents = {},
   }, { __index = Connection }) ---@cast self CodeCompanion.ACP.Connection
 
   return self
@@ -753,9 +754,34 @@ function Connection:send_notification(method, params)
   self:write_message(self.methods.encode(jsonrpc.notification(method, params)) .. "\n")
 end
 
+---The updates of a sub-agent's session that reach the chat
+local SUBAGENT_UPDATES = {
+  subagent_spawned = true,
+  subagent_state_update = true,
+  tool_call = true,
+  tool_call_update = true,
+}
+
 ---@private
 local DISPATCH = {
   [METHODS.SESSION_UPDATE] = function(self, m)
+    -- sub-agents run in their own sessions, announced on their parent's session;
+    -- ref: https://agentclientprotocol.com/rfds/subagents
+    local kind = m.params.update and m.params.update.sessionUpdate
+    if kind == "subagent_spawned" and type(m.params.update.subagentSessionId) == "string" then
+      self._subagents[m.params.update.subagentSessionId] = true
+    end
+    -- the chat shows a sub-agent's status and tool calls, live only; its other
+    -- updates are dropped, while its requests (approvals, file access) are
+    -- still handled
+    if
+      self.session_id
+      and m.params.sessionId ~= self.session_id
+      and (self._loading_session or not SUBAGENT_UPDATES[kind])
+    then
+      return
+    end
+
     if m.params.update and m.params.update.sessionUpdate == "available_commands_update" then
       self:handle_available_commands_update(m.params.sessionId, m.params.update.availableCommands)
     elseif m.params.update and m.params.update.sessionUpdate == "config_option_update" then
@@ -774,7 +800,7 @@ local DISPATCH = {
     elseif self._loading_session and self._on_session_update then
       self._on_session_update(m.params.update)
     elseif self._active_prompt then
-      self._active_prompt:handle_session_update(m.params.update)
+      self._active_prompt:handle_session_update(m.params.update, m.params.sessionId)
     end
   end,
   [METHODS.SESSION_REQUEST_PERMISSION] = function(self, m)
@@ -799,7 +825,7 @@ function Connection:handle_incoming_request_or_notification(notification)
 
   local sid = notification.params and notification.params.sessionId
   local is_request = notification.id ~= nil
-  if sid and self.session_id and sid ~= self.session_id then
+  if sid and self.session_id and not self:_owns_session(sid) then
     if is_request then
       return self:send_error(notification.id, "invalid sessionId", jsonrpc.errors.INVALID_PARAMS)
     end
@@ -898,11 +924,18 @@ function Connection:steer(messages, callback)
   return true
 end
 
----Check if params target the active session
+---Whether the session is the active one or one of its sub-agents
+---@param sid string
+---@return boolean
+function Connection:_owns_session(sid)
+  return sid == self.session_id or self._subagents[sid] == true
+end
+
+---Check if params target the active session or one of its sub-agents
 ---@param params table
----@return boolean valid true if an active session exists and sessionId matches it
+---@return boolean valid true if an active session exists and owns the sessionId
 function Connection:_has_valid_session_id(params)
-  return self.session_id ~= nil and params.sessionId == self.session_id
+  return self.session_id ~= nil and self:_owns_session(params.sessionId)
 end
 
 ---Handle fs/read_text_file requests
@@ -1051,6 +1084,7 @@ function Connection:handle_process_exit(code, signal)
   self._initialized = false
   self._pending_callbacks = {}
   self._steering_ids = {}
+  self._subagents = {}
   self.pending_responses = {}
   self.session_id = nil
 

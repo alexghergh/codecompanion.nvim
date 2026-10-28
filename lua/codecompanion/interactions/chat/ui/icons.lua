@@ -12,7 +12,7 @@ local CONSTANTS = {
 ---@param bufnr number
 ---@param line number 0-based line number
 ---@param status string The tool status (in_progress, completed, failed)
----@param opts? { priority?: number, virt_text_pos?: string }
+---@param opts? { priority?: number, virt_text_pos?: string, indent?: string } `indent` is drawn before the icon
 ---@return number|nil The extmark id or nil if status is invalid
 function Icons.apply(bufnr, line, status, opts)
   opts = vim.tbl_deep_extend("force", {
@@ -51,8 +51,13 @@ function Icons.apply(bufnr, line, status, opts)
   -- (prevents glob patterns like **/* rendering as bold, backtick remnants as code, etc.)
   local line_text = api.nvim_buf_get_lines(bufnr, line, line + 1, false)[1] or ""
 
+  local virt_text = { { config_entry.icon, config_entry.hl_group } }
+  if opts.indent then
+    table.insert(virt_text, 1, { opts.indent })
+  end
+
   return api.nvim_buf_set_extmark(bufnr, CONSTANTS.NS_TOOL_ICONS, line, 0, {
-    virt_text = { { config_entry.icon, config_entry.hl_group } },
+    virt_text = virt_text,
     virt_text_pos = opts.virt_text_pos,
     priority = math.max(opts.priority, 200),
     hl_group = "CodeCompanionChatToolText",

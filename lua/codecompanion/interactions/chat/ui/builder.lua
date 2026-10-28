@@ -353,7 +353,7 @@ end
 
 ---Place a tool status icon on the block's first content line, if one is requested
 ---@param insert_line number 0-based line where the write began
----@param opts { status?: string, _icon_info?: table, virt_text_pos?: string }
+---@param opts { status?: string, _icon_info?: table, virt_text_pos?: string, indent?: string }
 ---@param content_start? number Lines preceding the content within this write
 ---@return number|nil icon_id
 function Builder:_apply_icon(insert_line, opts, content_start)
@@ -364,13 +364,18 @@ function Builder:_apply_icon(insert_line, opts, content_start)
   end
 
   local offset = (content_start or 0) + ((info and info.line_offset) or 0)
-  return Icons.apply(self.chat.bufnr, insert_line + offset, status, { virt_text_pos = opts.virt_text_pos })
+  return Icons.apply(
+    self.chat.bufnr,
+    insert_line + offset,
+    status,
+    { virt_text_pos = opts.virt_text_pos, indent = opts.indent }
+  )
 end
 
 ---Update a specific line in the chat buffer
 ---@param line_number number The
 ---@param content string
----@param opts? { status?: string, icon_id?: number, priority?: number, virt_text_pos?: string }
+---@param opts? { status?: string, icon_id?: number, priority?: number, virt_text_pos?: string, indent?: string }
 ---@return boolean
 ---@return number|nil
 function Builder:update_line(line_number, content, opts)

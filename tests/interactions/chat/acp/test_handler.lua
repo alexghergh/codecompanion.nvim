@@ -894,6 +894,38 @@ T["ACPHandler"]["collects streamed terminal output across updates"] = function()
   h.eq("first\nsecond\n", result)
 end
 
+T["ACPHandler"]["skips an update for an unseen tool call that has nothing to show"] = function()
+  local result = child.lua([[
+    local chat = h.setup_chat_buffer({}, {
+      name = "test_acp",
+      config = { name = "test_acp", type = "acp", handlers = { form_messages = function(a, m) return m end } },
+    })
+    local handler = require("codecompanion.interactions.chat.acp.handler").new(chat)
+    local added = {}
+    chat.add_buf_message = function(self, data) table.insert(added, data.content) end
+
+    -- claude-agent-acp hides the Agent tool call once sub-agents are declared, but still sends this
+    handler:process_tool_call({
+      toolCallId = "agent-1",
+      sessionUpdate = "tool_call_update",
+      _meta = { claudeCode = { toolName = "Agent", toolResponse = { status = "completed" } } },
+    })
+    -- an update that names the tool call still adds a line
+    handler:process_tool_call({
+      toolCallId = "exec-1",
+      sessionUpdate = "tool_call_update",
+      status = "in_progress",
+      kind = "execute",
+      title = "ls",
+    })
+
+    return added
+  ]])
+
+  h.eq(1, #result)
+  h.eq(true, result[1]:find("ls", 1, true) ~= nil)
+end
+
 local GUTTER = "  \u{2514} "
 
 T["ACPHandler"]["Tool Output"] = new_set({
@@ -943,6 +975,41 @@ T["ACPHandler"]["Tool Output"]["previews two lines of command output and keeps t
   ]])
 
   h.eq({ GUTTER .. "one", "    two", "    three", "    four" }, vim.list_slice(below, 1, 4))
+end
+
+T["ACPHandler"]["Tool Output"]["indents a sub-agent's tool call and its output"] = function()
+  local result = child.lua([[
+    local Icons = require("codecompanion.interactions.chat.ui.icons")
+    local function first_chunk(label)
+      for row, line in ipairs(vim.api.nvim_buf_get_lines(chat.bufnr, 0, -1, false)) do
+        if line:find(label, 1, true) then
+          local marks = vim.api.nvim_buf_get_extmarks(chat.bufnr, Icons.ns(), { row - 1, 0 }, { row - 1, -1 }, { details = true })
+          return marks[1][4].virt_text[1][1]
+        end
+      end
+    end
+
+    handler:process_tool_call({ toolCallId = "main-1", sessionUpdate = "tool_call", status = "in_progress", kind = "execute", title = "pwd" })
+    local sub = { subagent = "sub-1" }
+    handler:process_tool_call({ toolCallId = "sub-1-ls", sessionUpdate = "tool_call", status = "in_progress", kind = "execute", title = "ls" }, sub)
+    handler:process_tool_call({
+      toolCallId = "sub-1-ls",
+      sessionUpdate = "tool_call_update",
+      status = "completed",
+      content = { { type = "content", content = { type = "text", text = "```\none\ntwo\n```" } } },
+    }, sub)
+
+    return {
+      main_icon = first_chunk("pwd"),
+      sub_icon = first_chunk("ls"),
+      below = vim.list_slice(lines_below_label("ls"), 1, 2),
+      in_progress = require("codecompanion.config").display.chat.icons.tool_in_progress,
+    }
+  ]])
+
+  h.eq(result.in_progress, result.main_icon)
+  h.eq("  ", result.sub_icon)
+  h.eq({ "  " .. GUTTER .. "one", "      two" }, result.below)
 end
 
 T["ACPHandler"]["Tool Output"]["streams command output into the block as it arrives"] = function()
@@ -1478,6 +1545,45 @@ T["ACPHandler"]["Config Options"]["reflects config option changes in metadata"] 
   h.eq("default", result.mode_before)
   h.eq("plan", result.mode_after)
   h.eq("Plan Mode", result.name_after)
+end
+
+T["ACPHandler"]["shows a sub-agent as one line that changes when it finishes"] = function()
+  local result = child.lua([[
+    local chat = h.setup_chat_buffer({}, {
+      name = "test_acp",
+      config = { name = "test_acp", type = "acp", handlers = { form_messages = function(a, m) return m end } },
+    })
+    local handler = require("codecompanion.interactions.chat.acp.handler").new(chat)
+    local Icons = require("codecompanion.interactions.chat.ui.icons")
+
+    local function subagent_lines()
+      local found = {}
+      for row, line in ipairs(vim.api.nvim_buf_get_lines(chat.bufnr, 0, -1, false)) do
+        if line:find("Sub-agent", 1, true) then
+          local marks = vim.api.nvim_buf_get_extmarks(chat.bufnr, Icons.ns(), { row - 1, 0 }, { row - 1, -1 }, { details = true })
+          local icon = marks[1] and marks[1][4].virt_text and marks[1][4].virt_text[1][1]
+          table.insert(found, { text = vim.trim(line), icon = icon })
+        end
+      end
+      return found
+    end
+
+    handler:process_subagent({
+      sessionUpdate = "subagent_spawned", subagentSessionId = "sub-1", name = "Explore", task = "look",
+    })
+    local running = subagent_lines()
+    handler:process_subagent({
+      sessionUpdate = "subagent_state_update", subagentSessionId = "sub-1", state = "cancelled",
+    })
+    return {
+      running = running,
+      finished = subagent_lines(),
+      icons = require("codecompanion.config").display.chat.icons,
+    }
+  ]])
+
+  h.eq({ { text = "Sub-agent: Explore", icon = result.icons.tool_in_progress } }, result.running)
+  h.eq({ { text = "Sub-agent: Explore (cancelled)", icon = result.icons.tool_failure } }, result.finished)
 end
 
 return T

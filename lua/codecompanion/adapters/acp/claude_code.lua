@@ -32,6 +32,8 @@ return {
     protocolVersion = 1,
     clientCapabilities = {
       fs = { readTextFile = true, writeTextFile = true },
+      -- the agent checks for a JSON object; `{}` would be sent as an array
+      subagents = vim.empty_dict(),
     },
     clientInfo = {
       name = "CodeCompanion.nvim",

@@ -750,6 +750,67 @@ T["ACP Responses"]["ignores notifications for other sessions"] = function()
   h.eq(result.last, "seen")
 end
 
+T["ACP Responses"]["accepts requests and tool calls from announced sub-agent sessions"] = function()
+  local result = child.lua([[
+    package.loaded["codecompanion.interactions.chat.acp.fs"] = {
+      read_text_file = function(path) return true, "content" end
+    }
+    local connection = create_test_connection()
+    connection.session_id = "session-A"
+    local sent = {}
+    function connection:write_message(data)
+      table.insert(sent, vim.json.decode(vim.trim(data)))
+      return true
+    end
+
+    local updates, permissions = {}, {}
+    connection._active_prompt = {
+      handle_session_update = function(self, u, sid)
+        table.insert(updates, u.sessionUpdate .. "@" .. sid)
+      end,
+      handle_permission_request = function(self, id, params)
+        table.insert(permissions, params.sessionId)
+      end,
+    }
+
+    local function update(sid, u)
+      return vim.json.encode({ jsonrpc = "2.0", method = "session/update", params = { sessionId = sid, update = u } })
+    end
+    local lines = {
+      update("session-A", { sessionUpdate = "subagent_spawned", subagentSessionId = "sub-1", name = "Explore", task = "look" }),
+      update("sub-1", { sessionUpdate = "tool_call", toolCallId = "t1", title = "ls" }),
+      update("sub-1", { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "hidden" } }),
+      update("sub-1", { sessionUpdate = "usage_update", used = 1, size = 2 }),
+      -- an unknown session stays ignored
+      update("session-B", { sessionUpdate = "tool_call", toolCallId = "t9", title = "ignored" }),
+      -- a sub-agent can spawn its own sub-agents
+      update("sub-1", { sessionUpdate = "subagent_spawned", subagentSessionId = "sub-2", name = "Nested", task = "deeper" }),
+      vim.json.encode({
+        jsonrpc = "2.0", id = 8, method = "session/request_permission",
+        params = { sessionId = "sub-1", toolCall = { toolCallId = "t2" }, options = {} }
+      }),
+      vim.json.encode({
+        jsonrpc = "2.0", id = 9, method = "fs/read_text_file",
+        params = { sessionId = "sub-2", path = "/tmp/x" }
+      }),
+      update("session-A", { sessionUpdate = "subagent_state_update", subagentSessionId = "sub-1", state = "completed" }),
+    }
+    connection:buffer_stdout_and_dispatch(table.concat(lines, "\n") .. "\n")
+    return { updates = updates, permissions = permissions, sent = sent }
+  ]])
+
+  h.eq(result.updates, {
+    "subagent_spawned@session-A",
+    "tool_call@sub-1",
+    "subagent_spawned@sub-1",
+    "subagent_state_update@session-A",
+  })
+  h.eq(result.permissions, { "sub-1" })
+  h.eq(#result.sent, 1)
+  h.eq(result.sent[1].id, 9)
+  h.eq(result.sent[1].result.content, "content")
+end
+
 T["ACP Responses"]["error response notifies active prompt"] = function()
   local result = child.lua([[
     local connection = create_test_connection({ schedule = function(fn) fn() end })

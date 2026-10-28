@@ -177,6 +177,53 @@ T["Prompt Builder"]["extracts text safely from non-text content"] = function()
   h.eq(result[3], "T:thinking")
 end
 
+T["Prompt Builder"]["passes sub-agent announcements and state changes to the sub-agent handler"] = function()
+  local result = child.lua([[
+    local connection = ACP.new({ adapter = test_adapter })
+    connection.session_id = "test-session-123"
+    connection._agent_info = agent_info
+
+    local seen = {}
+    local prompt = connection:session_prompt({ { role = "user", content = "hi" } })
+      :on_subagent(function(update) table.insert(seen, update.sessionUpdate .. ":" .. update.subagentSessionId) end)
+
+    prompt:handle_session_update({
+      sessionUpdate = "subagent_spawned", subagentSessionId = "sub-1", name = "Explore", task = "look"
+    })
+    prompt:handle_session_update({
+      sessionUpdate = "subagent_state_update", subagentSessionId = "sub-1", state = "completed"
+    })
+
+    return seen
+  ]])
+
+  h.eq(result, { "subagent_spawned:sub-1", "subagent_state_update:sub-1" })
+end
+
+T["Prompt Builder"]["tells the tool handlers which sub-agent a tool call came from"] = function()
+  local result = child.lua([[
+    local connection = ACP.new({ adapter = test_adapter })
+    connection.session_id = "test-session-123"
+    connection._agent_info = agent_info
+
+    local seen = {}
+    local function record(tool_call, opts)
+      table.insert(seen, tool_call.toolCallId .. ":" .. tostring(opts and opts.subagent))
+    end
+    local prompt = connection:session_prompt({ { role = "user", content = "hi" } })
+      :on_tool_call(record)
+      :on_tool_update(record)
+
+    prompt:handle_session_update({ sessionUpdate = "tool_call", toolCallId = "main" }, "test-session-123")
+    prompt:handle_session_update({ sessionUpdate = "tool_call", toolCallId = "child" }, "sub-1")
+    prompt:handle_session_update({ sessionUpdate = "tool_call_update", toolCallId = "child" }, "sub-1")
+
+    return seen
+  ]])
+
+  h.eq(result, { "main:nil", "child:sub-1", "child:sub-1" })
+end
+
 T["Prompt Builder"]["cancel sends notification (no id)"] = function()
   local result = child.lua([[
     local connection = ACP.new({ adapter = test_adapter })

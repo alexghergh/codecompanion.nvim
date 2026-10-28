@@ -64,6 +64,10 @@ function PromptBuilder:on_plan(fn)
   self.handlers.plan = fn
   return self
 end
+function PromptBuilder:on_subagent(fn)
+  self.handlers.subagent = fn
+  return self
+end
 function PromptBuilder:on_complete(fn)
   self.handlers.complete = fn
   return self
@@ -247,8 +251,9 @@ PromptBuilder.extract_text = extract_text
 
 ---Handle session update from the server
 ---@param params table
+---@param session_id? string The session the update came from: the prompt's own, or one of its sub-agents
 ---@return nil
-function PromptBuilder:handle_session_update(params)
+function PromptBuilder:handle_session_update(params, session_id)
   -- Fire streaming event on first chunk
   if self.options and not self._streaming_started then
     self._streaming_started = true
@@ -273,13 +278,15 @@ function PromptBuilder:handle_session_update(params)
     if self.handlers.plan then
       self.handlers.plan(params.entries or {})
     end
-  elseif params.sessionUpdate == "tool_call" then
-    if self.handlers.tool_call then
-      self.handlers.tool_call(params)
+  elseif params.sessionUpdate == "tool_call" or params.sessionUpdate == "tool_call_update" then
+    local handler = params.sessionUpdate == "tool_call" and self.handlers.tool_call or self.handlers.tool_update
+    if handler then
+      local from_subagent = session_id and session_id ~= self.connection.session_id
+      handler(params, from_subagent and { subagent = session_id } or nil)
     end
-  elseif params.sessionUpdate == "tool_call_update" then
-    if self.handlers.tool_update then
-      self.handlers.tool_update(params)
+  elseif params.sessionUpdate == "subagent_spawned" or params.sessionUpdate == "subagent_state_update" then
+    if self.handlers.subagent then
+      self.handlers.subagent(params)
     end
   end
 end

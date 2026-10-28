@@ -32,6 +32,7 @@ function ACPHandler.new(chat)
     edits = {},
     ui_state = {},
     output_blocks = {},
+    subagents = {},
     _permission = {
       active = false,
       queue = Queue.new(),
@@ -44,16 +45,18 @@ end
 
 local OUTPUT_NS = vim.api.nvim_create_namespace("CodeCompanion-acp_tool_output")
 local OUTPUT_PREVIEW_LINES = 2
+local SUBAGENT_INDENT = "  "
 
 ---Indent a tool's output for the chat buffer and turn its terminal escape codes into highlights;
 ---indented so the output can never read as markdown headings or fences
 ---@param output string[]
+---@param indent string Extra indent, for a sub-agent's tool call
 ---@return string[] block
 ---@return { row: number, col: number, end_col: number, hl_group: string }[] colors 0-based, relative to the block
-local function build_output_block(output)
+local function build_output_block(output, indent)
   local block, colors = {}, {}
   for i, line in ipairs(output) do
-    local prefix = i == 1 and "  \u{2514} " or "    "
+    local prefix = indent .. (i == 1 and "  \u{2514} " or "    ")
     local text, spans = ansi.parse(line)
     table.insert(block, prefix .. text)
     for _, span in ipairs(spans) do
@@ -264,14 +267,17 @@ function ACPHandler:create_and_send_prompt(payload)
     :on_thought_chunk(function(content)
       self:handle_thought_chunk(content)
     end)
-    :on_tool_call(function(tool_call)
-      self:process_tool_call(tool_call)
+    :on_tool_call(function(tool_call, opts)
+      self:process_tool_call(tool_call, opts)
     end)
-    :on_tool_update(function(tool_call)
-      self:process_tool_call(tool_call)
+    :on_tool_update(function(tool_call, opts)
+      self:process_tool_call(tool_call, opts)
     end)
     :on_permission_request(function(request)
       self:handle_permission_request(request)
+    end)
+    :on_subagent(function(update)
+      self:process_subagent(update)
     end)
     :on_complete(function()
       self:handle_complete()
@@ -375,14 +381,15 @@ end
 ---@param id string
 ---@param tool_call table
 ---@param label_line number 1-based line holding the tool label
+---@param indent string Extra indent, for a sub-agent's tool call
 ---@return nil
-function ACPHandler:_render_output(id, tool_call, label_line)
+function ACPHandler:_render_output(id, tool_call, label_line, indent)
   local output = formatter.output_lines(tool_call)
   if #output == 0 then
     return
   end
 
-  local block, colors = build_output_block(output)
+  local block, colors = build_output_block(output, indent)
 
   local bufnr = self.chat.bufnr
   local folds = self.chat.ui.folds
@@ -429,9 +436,18 @@ end
 
 ---Output tool call to the chat
 ---@param tool_call table
+---@param opts? { subagent?: string } The sub-agent session the tool call came from
 ---@return nil
-function ACPHandler:process_tool_call(tool_call)
+function ACPHandler:process_tool_call(tool_call, opts)
   local id = tool_call.toolCallId
+  local indent = opts and opts.subagent and SUBAGENT_INDENT or ""
+
+  -- An update for a tool call never seen before, without a title or status,
+  -- has nothing to show; claude-agent-acp hides its Agent tool calls once the
+  -- client supports sub-agents, but still sends one such update for each
+  if not self.tools[id] and not self.ui_state[id] and not tool_call.title and not tool_call.status then
+    return
+  end
 
   -- Render error output only on the transition into failed; agents may send
   -- further updates for an already-failed call
@@ -464,8 +480,28 @@ function ACPHandler:process_tool_call(tool_call)
     content = "[Error formatting tool output]"
   end
 
-  -- If the tool call has already written output to the chat buffer, update the
-  -- existing line rather than adding a new one
+  local line_number = self:_write_status_line(
+    id,
+    content,
+    tool_call.status,
+    indent,
+    { tools = { call_id = id }, kind = tool_call.kind }
+  )
+
+  if line_number and shows_output(tool_call, was_failed) then
+    self:_render_output(id, tool_call, line_number, indent)
+  end
+end
+
+---Write a status line with a status icon to the chat, or rewrite the line already written for `id`
+---@param id string
+---@param content string
+---@param status? string
+---@param indent string Drawn before the status icon
+---@param opts? table Extra options for a new line, passed to `add_buf_message()`
+---@return number|nil line_number 1-based
+function ACPHandler:_write_status_line(id, content, status, indent, opts)
+  indent = indent ~= "" and indent or nil
   local cached = self.ui_state[id]
   if cached then
     -- The cached line number goes stale when content is inserted above it
@@ -484,43 +520,67 @@ function ACPHandler:process_tool_call(tool_call)
       self.chat,
       line_number,
       content,
-      { status = tool_call.status, icon_id = cached.icon_id, priority = 120, virt_text_pos = "inline" }
+      { status = status, icon_id = cached.icon_id, priority = 120, virt_text_pos = "inline", indent = indent }
     )
 
     if call_ok and update_ok then
-      if tool_call.status == "completed" then
+      if status == "completed" then
         self.ui_state[id] = nil
       elseif new_icon_id then
         cached.icon_id = new_icon_id
       end
-      if shows_output(tool_call, was_failed) then
-        self:_render_output(id, tool_call, line_number)
-      end
-      return
+      return line_number
     end
 
-    if tool_call.status == "completed" then
+    if status == "completed" then
       self.ui_state[id] = nil
     end
-    log:debug("[ACP::Handler] Failed to update tool call line for toolCallId %s", id)
+    log:debug("[ACP::Handler] Failed to update the status line for %s", id)
   end
 
-  local line_number, icon_id = self.chat:add_buf_message({
-    role = config.constants.LLM_ROLE,
-    content = content,
-  }, {
-    status = tool_call.status or "in_progress",
-    virt_text_pos = "inline",
-    tools = { call_id = id },
-    kind = tool_call.kind,
-    type = self.chat.MESSAGE_TYPES.TOOL_MESSAGE,
-  })
+  local line_number, icon_id = self.chat:add_buf_message(
+    { role = config.constants.LLM_ROLE, content = content },
+    vim.tbl_extend("force", {
+      status = status or "in_progress",
+      virt_text_pos = "inline",
+      indent = indent,
+      type = self.chat.MESSAGE_TYPES.TOOL_MESSAGE,
+    }, opts or {})
+  )
 
   self.ui_state[id] = { line_number = line_number, icon_id = icon_id }
+  return line_number
+end
 
-  if line_number and shows_output(tool_call, was_failed) then
-    self:_render_output(id, tool_call, line_number)
+---Show a sub-agent as one status line: in progress once it starts, then completed or failed
+---@param update table A `subagent_spawned` or `subagent_state_update` session update
+---@return nil
+function ACPHandler:process_subagent(update)
+  local sid = update.subagentSessionId
+  if type(sid) ~= "string" then
+    return
   end
+
+  if update.sessionUpdate == "subagent_spawned" then
+    -- `task` is left out: claude-agent-acp sends the sub-agent's whole prompt
+    -- there, codex-acp "Delegated task for <name>"
+    local label = "Sub-agent: " .. (type(update.name) == "string" and update.name or "")
+    self.subagents[sid] = label
+    self:_write_status_line("subagent:" .. sid, label, "in_progress", "")
+    return
+  end
+
+  -- the update only carries an end state: completed, failed, cancelled or disconnected
+  local label = self.subagents[sid]
+  if not label then
+    return
+  end
+  local state = update.state
+  local status = state == "completed" and "completed" or "failed"
+  if state ~= "completed" and type(state) == "string" then
+    label = ("%s (%s)"):format(label, state)
+  end
+  self:_write_status_line("subagent:" .. sid, label, status, "")
 end
 
 ---Queue a permission request and process when ready
